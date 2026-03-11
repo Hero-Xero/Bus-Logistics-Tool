@@ -105,42 +105,38 @@ def setup_graph(meta: dict = None, unconstrained: bool = False):
     graph_cfg    = (meta or {}).get('graph', {})
     bbox         = graph_cfg.get('bbox', _DEFAULT_BBOX)
     
-    # Simple hash of bbox for caching
     bbox_hash = hashlib.md5(str(bbox).encode()).hexdigest()[:8]
     cache_dir   = 'cache'
-    pkl_file    = os.path.join(cache_dir, f"graph_{bbox_hash}.pkl")
-    cache_file  = os.path.join(cache_dir, f"graph_{bbox_hash}.graphml")
+    # NEW CACHE FILE NAME to completely ignore the old bloated pickle
+    pkl_file    = os.path.join(cache_dir, f"graph_{bbox_hash}_fast_v2.pkl")
     os.makedirs(cache_dir, exist_ok=True)
 
     if os.path.exists(pkl_file):
         import pickle
-        print(f"Loading cached road network (pickle): {pkl_file}")
+        print(f"Loading ultra-fast cached road network: {pkl_file}")
         with open(pkl_file, 'rb') as fh:
             G = pickle.load(fh)
-    elif os.path.exists(cache_file):
-        print(f"Loading cached road network: {cache_file}")
-        G = ox.load_graphml(cache_file)
-        # Save as pickle for faster future loads
-        import pickle
-        print(f"Saving pickle cache for faster future loads...")
-        with open(pkl_file, 'wb') as fh:
-            pickle.dump(G, fh, protocol=pickle.HIGHEST_PROTOCOL)
-    else:
-        print("Downloading road network...")
-        north, south, east, west = bbox[3], bbox[1], bbox[2], bbox[0]
-        # OSMnx 2.0+ expects a single tuple (north, south, east, west)
-        G = ox.graph_from_bbox((north, south, east, west), network_type='drive')
-        ox.save_graphml(G, cache_file)
-        import pickle
-        with open(pkl_file, 'wb') as fh:
-            pickle.dump(G, fh, protocol=pickle.HIGHEST_PROTOCOL)
+        
+        # If unconstrained Mode B is requested, just flip the flags instantly in memory
+        if unconstrained:
+            for u, v, k, data in G.edges(keys=True, data=True):
+                data['is_safe_to_cross'] = True
+        return G
 
+    print("Downloading/Building road network from scratch...")
+    north, south, east, west = bbox[3], bbox[1], bbox[2], bbox[0]
+    G = ox.graph_from_bbox((north, south, east, west), network_type='drive')
+    
     road_cfg     = _load_road_speeds((meta or {}).get('road_speeds'))
     road_types   = road_cfg['road_types']
     default_spd  = road_cfg.get('default_speed_kph', 30)
 
-    print("Applying road speed config...")
+    print("Applying road speeds and purging heavy geometries...")
     for u, v, k, data in G.edges(keys=True, data=True):
+        # NUKE SHAPELY GEOMETRIES TO SAVE 1.25 GB OF RAM PER LOAD
+        if 'geometry' in data:
+            del data['geometry']
+            
         maxspeed = data.get('maxspeed', default_spd)
         if isinstance(maxspeed, list):
             try:    base_speed = float(maxspeed[0])
@@ -151,12 +147,24 @@ def setup_graph(meta: dict = None, unconstrained: bool = False):
         highway = data.get('highway', 'unclassified')
         if isinstance(highway, list): highway = highway[0]
         cfg = road_types.get(highway, road_types.get('default', {'speed_multiplier': 0.2, 'safe_to_cross': True}))
-        data['speed_kph']       = base_speed * cfg['speed_multiplier']
-        data['is_safe_to_cross'] = True if unconstrained else cfg['safe_to_cross']
+        data['speed_kph'] = base_speed * cfg['speed_multiplier']
+        # Default save the constrained version
+        data['is_safe_to_cross'] = cfg['safe_to_cross']
         meters_per_min = (data['speed_kph'] * 1000) / 60
         data['travel_time'] = data['length'] / meters_per_min
-    print("Adding edge bearings for turn-penalty calculations...")
+        
+    print("Adding edge bearings...")
     G = ox.bearing.add_edge_bearings(G)
+    
+    print("Saving ultra-fast pickle cache...")
+    import pickle
+    with open(pkl_file, 'wb') as fh:
+        pickle.dump(G, fh, protocol=pickle.HIGHEST_PROTOCOL)
+
+    if unconstrained:
+        for u, v, k, data in G.edges(keys=True, data=True):
+            data['is_safe_to_cross'] = True
+            
     print(f"Graph ready: {G.number_of_nodes()} nodes, {G.number_of_edges()} edges\n")
     return G
 
@@ -164,30 +172,15 @@ def setup_graph(meta: dict = None, unconstrained: bool = False):
 # MATRIX PRECOMPUTATION
 # ============================================================================
 
+# In run_algorithm.py (around line 125)
 def precompute_matrix(students, routes, G, fast_mode=None, G_drive=None,
                       max_candidates=15):
-    """Build the distance matrix for ALNS.
-
-    Parameters
-    ----------
-    G       : graph used for walking BFS (may be constrained)
-    G_drive : graph used for bus driving distances (should always be the
-              full unconstrained network).  Falls back to *G* if not given,
-              preserving backward-compatibility.
-    max_candidates : int
-        Include up to this many walk-reachable candidate nodes per student
-        in the precomputed matrix.  Should match or exceed
-        ``max_candidates_per_student`` used by the ALNS engine (default 15)
-        so that insertion-cost checks never fall back to A*.
-    """
     if G_drive is None:
         G_drive = G
     print("[Optimization] Preparing distance matrix...")
     critical_nodes = set()
     student_frontages = {}
-    # Collect ALL candidate nodes ALNS will actually use so the precomputed
-    # matrix covers every node the optimizer can insert at.  The old [:5]
-    # limit caused massive A* fallback spikes on 600K-node graphs.
+    
     for s in students:
         node_id, _ = snap_address_to_edge(s.coords, G)
         critical_nodes.add(node_id)
@@ -196,25 +189,19 @@ def precompute_matrix(students, routes, G, fast_mode=None, G_drive=None,
             safe_nodes = find_safe_nodes_within_radius(s.coords, G, 500, s.walk_radius)
             for safe_node_id, _ in safe_nodes[:max_candidates]:
                 critical_nodes.add(safe_node_id)
+                
     school_node = None
     for route in routes:
         for stop in route.stops:
             if stop.node_id in G_drive:
                 critical_nodes.add(stop.node_id)
-                if school_node is None: school_node = stop.node_id
             else:
                 nearest = _det_eng.fast_nearest_node(G_drive, stop.coords[1], stop.coords[0])
                 stop.node_id = nearest
                 stop.coords = (G_drive.nodes[nearest]['y'], G_drive.nodes[nearest]['x'])
                 critical_nodes.add(nearest)
-                if school_node is None: school_node = nearest
-    # Auto-select fast mode for large graphs (>50K nodes) to avoid minutes-long precomputes
-    if fast_mode is None:
-        fast_mode = G_drive.number_of_nodes() > 50_000
-    # Bus distance matrix ALWAYS uses the full driving graph
-    # precalculate_distance_matrix(G_drive, list(critical_nodes), fast_mode=fast_mode)
-    
-    # OSRM-based precomputation: much faster on large graphs, but requires a local OSRM instance running with the same graph data.  Falls back to in-memory if OSRM fails for any reason (e.g. not running, different graph, etc.) — in that case a warning is printed and the function behaves like the old version, precomputing only the critical nodes with in-memory Dijkstra.
+
+    # DIRECTLY call OSRM, skip all fast_mode logic
     from detour_engine import precalculate_distance_matrix_osrm
     precalculate_distance_matrix_osrm(G_drive, list(critical_nodes))
     return critical_nodes, student_frontages

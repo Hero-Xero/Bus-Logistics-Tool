@@ -24,9 +24,7 @@ docker run -t -v "${PWD}:/data" osrm/osrm-backend \
 ### Start the OSRM server:
 
 ```bash
-docker run -d -p 5000:5000 -v "${PWD}:/data" osrm/osrm-backend \
-    osrm-routed /data/egypt-latest.osrm
+docker run -d -p 5000:5000 -v "${PWD}:/data" osrm/osrm-backend osrm-routed --max-table-size 8000 /data/egypt-latest.osrm
 ```
 
 Done. The routing engine is now available at `http://localhost:5000`.
-```

@@ -1,0 +1,7 @@
+
+⚠  This capture file is large and may take a long time to process  ⚠
+
+Next time, consider using the `--aggregate` option to `memray run` to reduce the size of the file.
+Check https://bloomberg.github.io/memray/run.html#aggregated-capture-files for more information.
+
+

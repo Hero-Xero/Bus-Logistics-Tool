@@ -9,6 +9,7 @@ This module provides the core algorithms for:
 5. Enforcing safety and time constraints
 """
 import requests
+import numpy as np
 import networkx as nx
 import osmnx as ox
 import math
@@ -35,8 +36,10 @@ def _get_walk_graph(graph):
     Cached after first creation."""
     global _WALK_GRAPH
     if _WALK_GRAPH is None:
-        _WALK_GRAPH = graph.to_undirected()
-    return _WALK_GRAPH
+        # CRITICAL FIX: as_view=True creates a zero-RAM reference view.
+        # Without this, NetworkX copies 600,000 nodes, leaking 10.4GB of RAM.
+        _WALK_GRAPH = graph.to_undirected(as_view=True)
+    return _WALK_GRAPH  
 
 
 def haversine_walk_distance(lat1, lon1, lat2, lon2):
@@ -51,14 +54,8 @@ def haversine_walk_distance(lat1, lon1, lat2, lon2):
     return R * c
 
 
-def walk_distance_on_roads(graph, node_a, node_b):
-    """Calculate walking distance along roads (undirected) between two nodes.
-    Ignores one-way restrictions and U-turn rules since pedestrians use sidewalks.
-    Results are cached for fast repeated lookups during ALNS.
-    
-    Returns:
-        float: distance in meters, or float('inf') if no path exists
-    """
+def walk_distance_on_roads(graph, node_a, node_b, cutoff=2000):
+    """Calculate walking distance with a strict 2km cutoff to prevent infinite searches."""
     if node_a == node_b:
         return 0.0
     cache_key = (node_a, node_b)
@@ -66,26 +63,22 @@ def walk_distance_on_roads(graph, node_a, node_b):
         return _WALK_DIST_CACHE[cache_key]
     walk_g = _get_walk_graph(graph)
     try:
-        dist = nx.shortest_path_length(walk_g, node_a, node_b, weight='length')
-    except (nx.NetworkXNoPath, nx.NodeNotFound):
+        dist = nx.single_source_dijkstra_path_length(walk_g, node_a, cutoff=cutoff, weight='length')[node_b]
+    except (nx.NetworkXNoPath, KeyError, nx.NodeNotFound):
         dist = float('inf')
     _WALK_DIST_CACHE[cache_key] = dist
-    _WALK_DIST_CACHE[(node_b, node_a)] = dist  # Symmetric
+    _WALK_DIST_CACHE[(node_b, node_a)] = dist
     return dist
 
 
-def walk_path_on_roads(graph, node_a, node_b):
-    """Find the walking path along roads (undirected) between two nodes.
-    Returns the list of node IDs along the path.
-    
-    Returns:
-        list: path node IDs, or empty list if no path exists
-    """
+def walk_path_on_roads(graph, node_a, node_b, cutoff=2000):
+    """Find the walking path with a strict 2km cutoff."""
     if node_a == node_b:
         return [node_a]
     walk_g = _get_walk_graph(graph)
     try:
-        return nx.shortest_path(walk_g, node_a, node_b, weight='length')
+        _, path = nx.single_source_dijkstra(walk_g, node_a, target=node_b, cutoff=cutoff, weight='length')
+        return path
     except (nx.NetworkXNoPath, nx.NodeNotFound):
         return []
 
@@ -213,10 +206,56 @@ def calculate_weighted_path_time(graph, path_nodes):
 
 
 # Global cache for shortest paths to speed up iterations
-_path_cache = {}
-_MATRIX_CACHE = {}       # (source, target) -> travel_time in minutes
-_MATRIX_CACHE_LENGTH = {} # (source, target) -> length in meters
+_path_cache = {}  # Keep this empty/unused to save RAM
 _DIJKSTRA_DONE = set()   # source nodes we've already run single-source Dijkstra on
+
+# --- ADD THE NEW CLASS HERE ---
+class NumpyMatrixCache:
+    def __init__(self):
+        self.node_to_idx = {}
+        self.time_matrix = None
+        self.length_matrix = None
+    def clear(self):
+        """Allows experiment scripts to reset the cache between runs."""
+        self.node_to_idx = {}
+        self.time_matrix = None
+        self.length_matrix = None
+    def populate(self, nodes_list, durations, distances):
+        # Map node IDs to matrix indices
+        self.node_to_idx = {node: i for i, node in enumerate(nodes_list)}
+        
+        # Convert raw OSRM lists to float32 NumPy arrays to save massive amounts of RAM
+        # Replace OSRM's 'None' with numpy.inf
+        dur_arr = np.array([[np.inf if x is None else x for x in row] for row in durations], dtype=np.float32)
+        dist_arr = np.array([[np.inf if x is None else x for x in row] for row in distances], dtype=np.float32)
+        
+        # Convert seconds to minutes for time matrix
+        self.time_matrix = dur_arr / 60.0
+        self.length_matrix = dist_arr
+
+    def get(self, key, default=float('inf')):
+        """Drop-in replacement for dict.get() for time lookups"""
+        u, v = key
+        i, j = self.node_to_idx.get(u), self.node_to_idx.get(v)
+        if i is None or j is None: return default
+        val = self.time_matrix[i, j]
+        return default if np.isinf(val) else float(val)
+        
+    def get_length(self, key, default=float('inf')):
+        """Lookup for distance/length matrix"""
+        u, v = key
+        i, j = self.node_to_idx.get(u), self.node_to_idx.get(v)
+        if i is None or j is None: return default
+        val = self.length_matrix[i, j]
+        return default if np.isinf(val) else float(val)
+
+    def __contains__(self, key):
+        u, v = key
+        return u in self.node_to_idx and v in self.node_to_idx
+
+# --- REPLACE THE OLD DICTIONARIES WITH THE NEW CLASS INSTANCES ---
+_MATRIX_CACHE = NumpyMatrixCache()
+_MATRIX_CACHE_LENGTH = NumpyMatrixCache()
 
 # Graph-free mode: pre-registered (lat, lon) -> (node_id, (lat, lon)) mappings.
 # When set, snap_address_to_edge returns immediately without touching OSMnx.
@@ -230,7 +269,7 @@ _COORD_SNAP_CACHE = {}
 # ox.nearest_edges + edge splitting (~4s on large graphs).  Set this before
 # running experiments on large city graphs.  Results are slightly less precise
 # (snaps to road intersection rather than road edge) but comparisons remain valid.
-_FAST_SNAP_MODE = False
+_FAST_SNAP_MODE = True
 
 # Pre-built BallTree for fast nearest-node lookup.  Built once per graph to
 # avoid OSMnx rebuilding it (+ converting 609K nodes to GeoDataFrame) on every call.
@@ -306,6 +345,7 @@ def find_shortest_path_with_turns(graph, source, target, weight='travel_time', i
     This prevents 180-degree turns and applies minor penalties for 90-degree turns.
     Uses a predecessor map instead of storing full paths on the heap for speed.
     """
+    """NEUTERED: Prevents massive memory leaks. A* is no longer allowed."""
     return None, float('inf')
 
     if source == target:
@@ -493,86 +533,42 @@ def precalculate_distance_matrix(graph, critical_node_ids, fast_mode=False):
 
 
 def shortest_path_length_with_turns(graph, source, target, weight='travel_time', initial_bearing=None):
-    """Fast lookup from Matrix Cache if available, else run A*."""
-    if initial_bearing is None:
-        if weight == 'length' and (source, target) in _MATRIX_CACHE_LENGTH:
-            return _MATRIX_CACHE_LENGTH[(source, target)]
-        if weight == 'travel_time' and (source, target) in _MATRIX_CACHE:
-            return _MATRIX_CACHE[(source, target)]
-        
-    _, t = find_shortest_path_with_turns(graph, source, target, weight=weight, initial_bearing=initial_bearing)
-    return t
+    """Strictly use the Numpy cache. No A* fallbacks."""
+    if weight == 'length':
+        return _MATRIX_CACHE_LENGTH.get_length((source, target), float('inf'))
+    return _MATRIX_CACHE.get((source, target), float('inf'))
 
 
 def calculate_route_time_from_matrix(stops, graph=None):
-    """Ultra-fast route time using O(1) matrix lookups.
-    On cache miss: lazily computes the pair via A* and caches it.
-    No need for upfront all-pairs precomputation.
-    """
+    """Ultra-fast route time using strictly O(1) matrix lookups. Never falls back to A*."""
     if len(stops) < 2:
         return 0.0
     total = 0.0
     for i in range(len(stops) - 1):
         pair = (stops[i].node_id, stops[i+1].node_id)
-        if pair in _MATRIX_CACHE:
-            t = _MATRIX_CACHE[pair]
-            if t == float('inf'):
-                return 9999.0
-            total += t
-        elif graph is not None:
-            # Lazy compute: run A* once, result is cached for future lookups
-            path, t = find_shortest_path_with_turns(graph, pair[0], pair[1])
-            if t == float('inf'):
-                return 9999.0
-            # Also compute length while we have the path
-            if path:
-                dist_m = 0.0
-                for pi in range(len(path) - 1):
-                    ed = graph.get_edge_data(path[pi], path[pi+1])
-                    if ed:
-                        d = ed[0] if 0 in ed else list(ed.values())[0]
-                        dist_m += d.get('length', 0)
-                _MATRIX_CACHE_LENGTH[pair] = dist_m
-            total += t
-        else:
-            return None  # No graph provided, can't compute
+        
+        # Check the new Numpy cache
+        t = _MATRIX_CACHE.get(pair, float('inf'))
+        if t == float('inf'):
+            return 9999.0 # Dead end / unroutable, penalize heavily
+            
+        total += t
     return total
 
-
 def calculate_route_distance_from_matrix(stops, graph=None):
-    """Ultra-fast route distance using O(1) matrix lookups.
-    On cache miss: lazily computes the pair via A* and caches it.
-    Returns distance in kilometers.
-    """
+    """Ultra-fast route distance using strictly O(1) matrix lookups."""
     if len(stops) < 2:
         return 0.0
     total_m = 0.0
     for i in range(len(stops) - 1):
         pair = (stops[i].node_id, stops[i+1].node_id)
-        if pair in _MATRIX_CACHE_LENGTH:
-            d = _MATRIX_CACHE_LENGTH[pair]
-            if d == float('inf'):
-                return 0.0
-            total_m += d
-        elif graph is not None:
-            # Lazy compute: run A* to get path, compute length from it
-            path, t = find_shortest_path_with_turns(graph, pair[0], pair[1])
-            if path and t < float('inf'):
-                dist_m = 0.0
-                for pi in range(len(path) - 1):
-                    ed = graph.get_edge_data(path[pi], path[pi+1])
-                    if ed:
-                        dd = ed[0] if 0 in ed else list(ed.values())[0]
-                        dist_m += dd.get('length', 0)
-                _MATRIX_CACHE_LENGTH[pair] = dist_m
-                total_m += dist_m
-            else:
-                _MATRIX_CACHE_LENGTH[pair] = float('inf')
-                return 0.0
-        else:
-            return None  # No graph provided
+        
+        d = _MATRIX_CACHE.get_length(pair, float('inf'))
+        if d == float('inf'):
+            return 0.0 # Unroutable
+            
+        total_m += d
     return total_m / 1000.0
-
 
 def get_bearing_of_path(graph, path):
     """Get the bearing of the last edge in a path."""
@@ -768,93 +764,33 @@ def _candidate_points(graph, node) -> int:
 # Cache for pedestrian-safe nodes (stores full BFS result; scoring/truncation applied at call time)
 _safe_nodes_cache = {}
 
-def find_safe_nodes_within_radius(coords, graph, radius_meters, walk_distance_limit,
-                                   candidate_cfg=None):
-    """Find all nodes reachable by walking within *walk_distance_limit* metres.
-
-    Walking semantics
-    -----------------
-    The BFS is **bidirectional** (pedestrians ignore one-way rules) and only
-    traverses edges where ``is_safe_to_cross`` is True.
-
-    The ``is_safe_to_cross`` flag is set per-edge by ``setup_graph``:
-
-    * **Constrained** graph → primary / trunk / secondary are False;
-      tertiary / residential / living_street / default are True.
-    * **Unconstrained** graph → ALL edges are True.
-
-    This means:
-    * On the constrained graph the BFS can walk along residential +
-      tertiary streets but cannot cross primary / trunk / secondary.
-    * On the unconstrained graph the BFS explores freely.
-
-    Candidate scoring (when *candidate_cfg* is provided)
-    ------------------------------------------------------
-    The full BFS result is cached, then ranked and truncated:
-
-    * The home snap node (distance 0) is **always** included first.
-    * Remaining nodes are sorted by ``(-points, walk_dist)``:
-        - 2-point nodes first  (intersection **and** tertiary+)
-        - 1-point nodes next   (one criterion met)
-        - 0-point nodes last   (mid-block residential)
-        - ties broken by ascending walk distance
-    * Truncated to ``candidate_cfg["max_candidates_per_student"]`` total.
-
-    Returns a list of ``(node_id, distance_metres)`` tuples.
-    """
+def find_safe_nodes_within_radius(coords, graph, radius_meters, walk_distance_limit, candidate_cfg=None):
+    """NetworkX optimized safe node finder. Kills the exponential BFS blowup."""
     lat, lon = coords
     cache_key = (lat, lon, walk_distance_limit)
     if cache_key in _safe_nodes_cache:
         all_reachable = _safe_nodes_cache[cache_key]
-        # Apply scoring/truncation on the cached full result if config given
         if candidate_cfg:
-            return _rank_and_truncate_candidates(
-                all_reachable, graph, fast_nearest_node(graph, lon, lat), candidate_cfg
-            )
+            return _rank_and_truncate_candidates(all_reachable, graph, fast_nearest_node(graph, lon, lat), candidate_cfg)
         return all_reachable
 
     start_node = fast_nearest_node(graph, lon, lat)
 
-    safe_nodes = []
-    visited = set()
-    queue = [(start_node, 0)]  # (node, distance_so_far)
+    # 1. Create a zero-RAM view of only the safe-to-cross edges
+    def filter_edge(u, v, k):
+        return graph[u][v][k].get('is_safe_to_cross', True)
+        
+    safe_graph = nx.subgraph_view(graph, filter_edge=filter_edge)
+    walk_g = safe_graph.to_undirected(as_view=True)
 
-    while queue:
-        current_node, dist_so_far = queue.pop(0)
-
-        if current_node in visited or dist_so_far > walk_distance_limit:
-            continue
-        visited.add(current_node)
-
-        safe_nodes.append((current_node, dist_so_far))
-
-        # Walk along any edge marked safe (bidirectional)
-        for neighbor in graph.successors(current_node):
-            edge_data = graph[current_node][neighbor]
-            is_safe = False
-            edge_length = float('inf')
-            for key, data in edge_data.items():
-                if data.get('is_safe_to_cross', True):
-                    is_safe = True
-                    edge_length = min(edge_length, data.get('length', 0))
-            if is_safe:
-                new_dist = dist_so_far + edge_length
-                if new_dist <= walk_distance_limit:
-                    queue.append((neighbor, new_dist))
-
-        # Also walk against traffic (pedestrians are bidirectional)
-        for predecessor in graph.predecessors(current_node):
-            edge_data = graph[predecessor][current_node]
-            is_safe = False
-            edge_length = float('inf')
-            for key, data in edge_data.items():
-                if data.get('is_safe_to_cross', True):
-                    is_safe = True
-                    edge_length = min(edge_length, data.get('length', 0))
-            if is_safe:
-                new_dist = dist_so_far + edge_length
-                if new_dist <= walk_distance_limit:
-                    queue.append((predecessor, new_dist))
+    # 2. Use blazing-fast Dijkstra to find all nodes within the limit
+    try:
+        lengths = nx.single_source_dijkstra_path_length(
+            walk_g, start_node, cutoff=walk_distance_limit, weight='length'
+        )
+        safe_nodes = [(n, float(d)) for n, d in lengths.items()]
+    except (nx.NetworkXNoPath, nx.NodeNotFound):
+        safe_nodes = [(start_node, 0.0)]
 
     _safe_nodes_cache[cache_key] = safe_nodes
 
@@ -972,178 +908,54 @@ def calculate_route_path_and_stats(graph, stops, weight='travel_time'):
 
 
 def calculate_route_time(route, graph):
-    """Calculate total travel time of a route in minutes.
-    """
-    if len(route.stops) < 2:
-        return 0.0
-    
-    _, total_time = calculate_route_path_and_stats(graph, route.stops)
-    return total_time if total_time != float('inf') else 9999.0
-
+    if len(route.stops) < 2: return 0.0
+    return calculate_route_time_from_matrix(route.stops, graph)
 
 def calculate_stops_time(stops, graph):
-    """Purely functional travel time calculation for a sequence of Stop objects.
-    Does not modify any objects.
-    """
-    if len(stops) < 2:
-        return 0.0
-    # Reuses the existing logic that handles turn penalties
-    _, total_time = calculate_route_path_and_stats(graph, stops)
-    return total_time if total_time != float('inf') else 9999.0
-
+    if len(stops) < 2: return 0.0
+    return calculate_route_time_from_matrix(stops, graph)
 
 def calculate_student_ride_time(route, graph):
-    """Calculate the travel time from the first student boarding to the end (school).
-    """
-    if len(route.stops) < 2:
-        return 0.0
-    
-    # Find the index of the first stop that has students
-    first_student_stop_idx = -1
-    for i, stop in enumerate(route.stops):
-        if stop.get_student_count() > 0:
-            first_student_stop_idx = i
-            break
-            
+    if len(route.stops) < 2: return 0.0
+    first_student_stop_idx = next((i for i, stop in enumerate(route.stops) if stop.get_student_count() > 0), -1)
     if first_student_stop_idx == -1 or first_student_stop_idx >= len(route.stops) - 1:
         return 0.0
-        
     student_stops = route.stops[first_student_stop_idx:]
-    _, ride_time = calculate_route_path_and_stats(graph, student_stops)
-    return ride_time if ride_time != float('inf') else 9999.0
-
+    return calculate_route_time_from_matrix(student_stops, graph)
 
 def calculate_student_ride_time_potential(route, new_stop, insert_position, graph):
-    """Calculate what the student ride time WOULD be if a stop were inserted.
-    
-    Args:
-        route: Route object
-        new_stop: Stop object to potentially insert
-        insert_position: Index where new_stop would be placed
-        graph: NetworkX graph
-        
-    Returns:
-        float: Predicted student ride time in minutes
-    """
-    # Create temporary stop list with new_stop inserted at its candidate position.
     temp_stops = list(route.stops)
     temp_stops.insert(insert_position, new_stop)
-
-    # The new student boards at insert_position.  Their ride time is the sum
-    # of legs from that stop to school — NOT from the first occupied stop in
-    # the route (which was the previous, incorrect behaviour).
     if insert_position >= len(temp_stops) - 1:
         return 0.0
 
     ride_time = 0.0
     for i in range(insert_position, len(temp_stops) - 1):
-        u = temp_stops[i].node_id
-        v = temp_stops[i + 1].node_id
-        # Fast matrix lookup first
-        if (u, v) in _MATRIX_CACHE:
-            t = _MATRIX_CACHE[(u, v)]
-            if t == float('inf'):
-                return 9999.0
-            ride_time += t
-        else:
-            # Fallback to graph search
-            path, time_minutes = find_shortest_path_with_turns(graph, u, v)
-            if time_minutes < float('inf'):
-                ride_time += time_minutes
-            else:
-                return 9999.0
-    return ride_time
-
-
-def calculate_afternoon_ride_time_potential(route, new_stop, insert_position, graph,
-                                            target_stop=None):
-    """Compute the PM ride time for a student in the reversed route after a potential insertion.
-    
-    Afternoon route = morning route with pickup stops reversed:
-        [School, Stop_n, ..., Stop_1, School]
-    A student's afternoon ride = time from school to their stop in the reversed sequence.
-    Students near school in the morning (last pickup) are dropped off FIRST in the afternoon.
-    
-    Args:
-        route: Route object (morning direction)
-        new_stop: Stop being inserted
-        insert_position: Position in morning sequence
-        graph: NetworkX graph
-        target_stop: Which stop to measure for; None → new_stop itself
-    
-    Returns:
-        float: Afternoon ride time in minutes
-    """
-    temp_stops = list(route.stops)
-    temp_stops.insert(insert_position, new_stop)
-
-    # Reverse the interior pickup stops; keep school at start/end
-    interior = temp_stops[1:-1][::-1]
-    afternoon_stops = [temp_stops[0]] + interior + [temp_stops[-1]]
-
-    target = target_stop if target_stop is not None else new_stop
-
-    # Find target in afternoon sequence (match by identity first, then node_id)
-    target_idx = -1
-    for i, s in enumerate(afternoon_stops):
-        if s is target or (target_stop is None and s.node_id == new_stop.node_id):
-            target_idx = i
-            break
-
-    if target_idx <= 0:
-        return 0.0  # school position or not found
-
-    ride_time = 0.0
-    for i in range(target_idx):
-        u = afternoon_stops[i].node_id
-        v = afternoon_stops[i + 1].node_id
-        t = _MATRIX_CACHE.get((u, v), None)
-        if t is None:
-            _, t = find_shortest_path_with_turns(graph, u, v)
+        u, v = temp_stops[i].node_id, temp_stops[i + 1].node_id
+        t = _MATRIX_CACHE.get((u, v), float('inf'))
         if t == float('inf'):
             return 9999.0
         ride_time += t
     return ride_time
-    """Check if all students on the route can reach their stops safely.
-    
-    A route is safe if every student can reach their assigned stop via
-    a pedestrian path that does not cross any arterial roads, and within
-    their maximum walk distance.
-    
-    Args:
-        route: Route object
-        graph: NetworkX road network
-        walk_distance_limits: Dict mapping stop_id to max walk distance
-        
-    Returns:
-        Tuple of (is_safe: bool, unsafe_students: list)
-            - is_safe: True if all students can reach stops safely
-            - unsafe_students: List of (student, reason) for unsafe assignments
-    """
-    unsafe_students = []
-    
-    for stop in route.stops:
-        for student in stop.students:
-            # Check 1: Student is within walk distance of stop
-            lat_s, lon_s = student.coords
-            lat_stop, lon_stop = stop.coords
-            
-            walk_distance = math.sqrt((lat_s - lat_stop)**2 + (lon_s - lon_stop)**2) * 111000  # meters
-            
-            if walk_distance > student.walk_radius:
-                unsafe_students.append((student, f"Beyond walk radius: {walk_distance}m > {student.walk_radius}m"))
-                continue
-            
-            # Check 2: Path from student to stop is safe (details in find_safe_nodes_within_radius)
-            safe_nodes = find_safe_nodes_within_radius(
-                student.coords, graph, 500, student.walk_radius
-            )
-            safe_node_ids = [n[0] for n in safe_nodes]
-            
-            if stop.node_id not in safe_node_ids:
-                unsafe_students.append((student, "No safe pedestrian path to stop (arterial crossing required)"))
-    
-    return len(unsafe_students) == 0, unsafe_students
+
+def calculate_afternoon_ride_time_potential(route, new_stop, insert_position, graph, target_stop=None):
+    temp_stops = list(route.stops)
+    temp_stops.insert(insert_position, new_stop)
+    interior = temp_stops[1:-1][::-1]
+    afternoon_stops = [temp_stops[0]] + interior + [temp_stops[-1]]
+    target = target_stop if target_stop is not None else new_stop
+
+    target_idx = next((i for i, s in enumerate(afternoon_stops) if s is target or (target_stop is None and s.node_id == new_stop.node_id)), -1)
+    if target_idx <= 0: return 0.0
+
+    ride_time = 0.0
+    for i in range(target_idx):
+        u, v = afternoon_stops[i].node_id, afternoon_stops[i + 1].node_id
+        t = _MATRIX_CACHE.get((u, v), float('inf'))
+        if t == float('inf'):
+            return 9999.0
+        ride_time += t
+    return ride_time
 
 
 # ============================================================================
@@ -1216,59 +1028,22 @@ def validate_temporary_detour(new_stop, route, delta_time_minutes, daily_budget=
 
 
 def compute_direct_time(student, school_node, graph):
-    """Compute direct drive time from student's home to school (minutes).
-    
-    Uses the precomputed distance matrix when available, falling back to
-    an on-demand A* search.  Result is cached on the student object so
-    subsequent calls are O(1).
-    
-    Args:
-        student: Student object (must have .coords)
-        school_node: OSM node ID of the school
-        graph: NetworkX road network
-    
-    Returns:
-        float: Travel time in minutes (direct, no detours)
-    """
     if student.direct_time_to_school is not None:
         return student.direct_time_to_school
-
     lat, lon = student.coords
     student_node = fast_nearest_node(graph, lon, lat)
-
-    # Check precomputed matrix first (fast, no graph search)
-    cached = _MATRIX_CACHE.get((student_node, school_node), None)
-    if cached is not None and cached < float('inf'):
-        student.direct_time_to_school = cached
-        return cached
-
-    # Fallback: on-demand A* search
-    _, t = find_shortest_path_with_turns(graph, student_node, school_node)
-    if t == float('inf'):
-        # Last-resort: try nearest reachable node
-        t = float('inf')
+    
+    t = _MATRIX_CACHE.get((student_node, school_node), float('inf'))
     student.direct_time_to_school = t
     return t
 
-
 def compute_afternoon_direct_time(student, school_node, graph):
-    """Compute direct drive time from school to student's home (afternoon direction).
-    
-    Due to one-way streets, this may differ from compute_direct_time.
-    Cached on student.direct_time_from_school for O(1) repeat calls.
-    """
     if getattr(student, 'direct_time_from_school', None) is not None:
         return student.direct_time_from_school
-
     lat, lon = student.coords
     student_node = fast_nearest_node(graph, lon, lat)
-
-    cached = _MATRIX_CACHE.get((school_node, student_node), None)
-    if cached is not None and cached < float('inf'):
-        student.direct_time_from_school = cached
-        return cached
-
-    _, t = find_shortest_path_with_turns(graph, school_node, student_node)
+    
+    t = _MATRIX_CACHE.get((school_node, student_node), float('inf'))
     student.direct_time_from_school = t
     return t
 
@@ -1567,43 +1342,29 @@ def cheapest_insertion(new_student, existing_routes, graph, detour_type='tempora
     ) if existing_routes else True
     
     if not frontage_reachable:
-        # Find nearest graph nodes that the bus CAN reach via bidirectional BFS
-        # (walking is not constrained by one-way streets)
+        # Find nearest graph nodes that the bus CAN reach using optimized Dijkstra
         lat, lon = new_student.coords
         try:
             center_node = fast_nearest_node(graph, lon, lat)
-            visited = set()
-            bfs_queue = [(center_node, 0)]
+            max_walk = get_walk_absolute_max(walk_limit)
+            walk_g = _get_walk_graph(graph)
+            
+            lengths = nx.single_source_dijkstra_path_length(
+                walk_g, center_node, cutoff=max_walk, weight='length'
+            )
+            
             reachable_candidates = []
-            max_walk = get_walk_absolute_max(walk_limit)  # Stage-based absolute max
             school_node = existing_routes[0].stops[0].node_id
-            while bfs_queue and len(reachable_candidates) < 10:
-                node, dist = bfs_queue.pop(0)
-                if node in visited or dist > max_walk:
-                    continue
-                visited.add(node)
+            
+            for node, dist in sorted(lengths.items(), key=lambda x: x[1]):
+                if len(reachable_candidates) >= 10:
+                    break
                 to_school = _MATRIX_CACHE.get((node, school_node), float('inf'))
                 from_school = _MATRIX_CACHE.get((school_node, node), float('inf'))
                 if to_school < float('inf') and from_school < float('inf'):
                     reachable_candidates.append((node, dist))
-                # Expand along out-edges
-                for neighbor in graph.successors(node):
-                    ed = graph.get_edge_data(node, neighbor)
-                    if ed:
-                        d = ed[0] if 0 in ed else list(ed.values())[0]
-                        new_dist = dist + d.get('length', 0)
-                        if new_dist <= max_walk:
-                            bfs_queue.append((neighbor, new_dist))
-                # Also expand along in-edges (walking is bidirectional)
-                for predecessor in graph.predecessors(node):
-                    ed = graph.get_edge_data(predecessor, node)
-                    if ed:
-                        d = ed[0] if 0 in ed else list(ed.values())[0]
-                        new_dist = dist + d.get('length', 0)
-                        if new_dist <= max_walk:
-                            bfs_queue.append((predecessor, new_dist))
             
-            for node_id, dist in sorted(reachable_candidates, key=lambda x: x[1]):
+            for node_id, dist in reachable_candidates:
                 if node_id not in candidate_node_ids:
                     candidate_node_ids.append(node_id)
         except Exception:
@@ -1890,24 +1651,12 @@ def process_detour_request(student, existing_routes, graph, detour_type='tempora
 # for OSRM integration: Precompute the full distance matrix for all nodes in the graph
 
 def precalculate_distance_matrix_osrm(G, nodes_list):
-    """
-    Replaces the memory-crashing Python A* matrix calculation.
-    Queries a local OSRM Docker container to get all distances instantly.
-    """
+    """Vectorized OSRM fetcher using Numpy for instant caching and low RAM footprint."""
     print(f"Asking local OSRM to calculate matrix for {len(nodes_list)} nodes...")
     
-    # 1. Map node IDs to their Longitude/Latitude
-    # OSRM expects the format: lon,lat
-    coords_str_list = []
-    for node in nodes_list:
-        lat = G.nodes[node]['y']
-        lon = G.nodes[node]['x']
-        coords_str_list.append(f"{lon},{lat}")
-        
+    coords_str_list = [f"{G.nodes[n]['x']},{G.nodes[n]['y']}" for n in nodes_list]
     coords_string = ";".join(coords_str_list)
     
-    # 2. Make the HTTP request to the local OSRM Docker container
-    # We ask for both 'duration' and 'distance' annotations
     url = f"http://localhost:5000/table/v1/driving/{coords_string}?annotations=duration,distance"
     
     try:
@@ -1921,22 +1670,10 @@ def precalculate_distance_matrix_osrm(G, nodes_list):
     durations = data.get('durations', [])
     distances = data.get('distances', [])
     
-    # 3. Save the results into the exact cache format the ALNS engine uses
-    for i, origin_node in enumerate(nodes_list):
-        for j, dest_node in enumerate(nodes_list):
-            
-            # --- HANDLE DURATIONS ---
-            if durations[i][j] is not None:
-                # Convert OSRM seconds to minutes
-                _MATRIX_CACHE[(origin_node, dest_node)] = durations[i][j] / 60.0
-            else:
-                # CRITICAL FIX: Prevent A* Death Spiral by caching infinity
-                _MATRIX_CACHE[(origin_node, dest_node)] = float('inf')
-                
-            # --- HANDLE DISTANCES ---
-            if distances[i][j] is not None:
-                _MATRIX_CACHE_LENGTH[(origin_node, dest_node)] = distances[i][j]
-            else:
-                _MATRIX_CACHE_LENGTH[(origin_node, dest_node)] = float('inf')
-                
-    print("OSRM Matrix calculation complete! Cache populated.")
+    # Populate the NumPy matrices instantly
+    _MATRIX_CACHE.populate(nodes_list, durations, distances)
+    # Mirror the data to the old variable name so your existing code doesn't break
+    global _MATRIX_CACHE_LENGTH
+    _MATRIX_CACHE_LENGTH = _MATRIX_CACHE 
+
+    print("OSRM Matrix calculation complete! NumPy Cache populated.")

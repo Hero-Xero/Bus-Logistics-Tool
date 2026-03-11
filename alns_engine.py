@@ -18,6 +18,26 @@ from detour_engine import (
 )
 from entities import Stop
 
+
+import detour_engine
+import solution_state
+
+# --- COMBINATORIAL EXPLOSION KILLER ---
+_FAST_WALK_CACHE = {}
+_ORIGINAL_WALK = detour_engine.calculate_walk_penalty
+
+def _blazing_fast_walk_penalty(student, node_id, graph):
+    key = (student.id, node_id)
+    if key not in _FAST_WALK_CACHE:
+        _FAST_WALK_CACHE[key] = _ORIGINAL_WALK(student, node_id, graph)
+    return _FAST_WALK_CACHE[key]
+
+# Intercept all slow calls across all files instantly
+detour_engine.calculate_walk_penalty = _blazing_fast_walk_penalty
+solution_state.calculate_walk_penalty = _blazing_fast_walk_penalty
+calculate_walk_penalty = _blazing_fast_walk_penalty
+# ---------------------------------------
+
 # ============================================================================
 # DESTROY OPERATORS
 # ============================================================================
@@ -249,49 +269,40 @@ def _get_insertions_for_route(student, route, graph, frontage_info):
         
         # Bus-reachable fallback: if frontage is unreachable, find nearby reachable nodes
         # via bidirectional BFS (walking ignores one-way constraints)
+        # Bus-reachable fallback: if frontage is unreachable, find nearby reachable nodes
+        # via optimized NetworkX Dijkstra (prevents exponential BFS blowups)
+        # Bus-reachable fallback: NetworkX optimized to prevent BFS infinite loops
         school_node = route.stops[0].node_id if route.stops else None
         if school_node:
             to_school = _MATRIX_CACHE.get((frontage_node_id, school_node), float('inf'))
             from_school = _MATRIX_CACHE.get((school_node, frontage_node_id), float('inf'))
+            
             if to_school == float('inf') or from_school == float('inf'):
-                from detour_engine import fast_nearest_node
+                from detour_engine import fast_nearest_node, _get_walk_graph
+                import networkx as nx
+                
                 lat, lon = student.coords
                 center_node = fast_nearest_node(graph, lon, lat)
-                max_walk = get_walk_absolute_max(student.walk_radius)  # Stage-based
-                visited = set()
-                bfs_queue = [(center_node, 0)]
-                while bfs_queue and len(candidate_nodes) < max_k:
-                    node, dist = bfs_queue.pop(0)
-                    if node in visited or dist > max_walk:
-                        continue
-                    visited.add(node)
-                    ts = _MATRIX_CACHE.get((node, school_node), float('inf'))
-                    fs = _MATRIX_CACHE.get((school_node, node), float('inf'))
-                    if ts < float('inf') and fs < float('inf'):
-                        if not any(c[0] == node for c in candidate_nodes):
-                            coords = (graph.nodes[node]['y'], graph.nodes[node]['x'])
-                            candidate_nodes.append((node, coords))
-                            dist_map[node] = float(dist)
-                    # Expand along out-edges
-                    for neighbor in graph.successors(node):
-                        ed = graph.get_edge_data(node, neighbor)
-                        if ed:
-                            d = ed[0] if 0 in ed else list(ed.values())[0]
-                            new_dist = dist + d.get('length', 0)
-                            if new_dist <= max_walk:
-                                bfs_queue.append((neighbor, new_dist))
-                    # Also expand along in-edges (walking is bidirectional)
-                    for predecessor in graph.predecessors(node):
-                        ed = graph.get_edge_data(predecessor, node)
-                        if ed:
-                            d = ed[0] if 0 in ed else list(ed.values())[0]
-                            new_dist = dist + d.get('length', 0)
-                            if new_dist <= max_walk:
-                                bfs_queue.append((predecessor, new_dist))
-        
-        candidate_nodes = candidate_nodes[:max_k]
-        _student_candidate_cache[student.id] = candidate_nodes
-        _student_candidate_dist[student.id]   = dist_map
+                max_walk = get_walk_absolute_max(student.walk_radius)
+                walk_g = _get_walk_graph(graph)
+                
+                try:
+                    lengths = nx.single_source_dijkstra_path_length(
+                        walk_g, center_node, cutoff=max_walk, weight='length'
+                    )
+                    
+                    for node, dist in sorted(lengths.items(), key=lambda x: x[1]):
+                        if len(candidate_nodes) >= max_k:
+                            break
+                        ts = _MATRIX_CACHE.get((node, school_node), float('inf'))
+                        fs = _MATRIX_CACHE.get((school_node, node), float('inf'))
+                        if ts < float('inf') and fs < float('inf'):
+                            if not any(c[0] == node for c in candidate_nodes):
+                                coords = (graph.nodes[node]['y'], graph.nodes[node]['x'])
+                                candidate_nodes.append((node, coords))
+                                dist_map[node] = float(dist)
+                except Exception:
+                    pass
     
     # Start and end stops are fixed (Depot/School), strictly insert between
     start_pos = 1 if len(route.stops) >= 2 else 0

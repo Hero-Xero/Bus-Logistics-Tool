@@ -338,76 +338,30 @@ _ARROW_TEXT = "          \u27A4          "
 
 
 def _compute_route_path(G, stops):
-    """Compute the full node-level path between consecutive stops.
+    """Pass-through so we can use OSRM geometries directly."""
+    return stops
 
-    Uses ``find_shortest_path_with_turns`` (bearing-aware A*) so that
-    U-turns are penalised / banned — matching the solver's routing logic.
 
-    The matrix cache only stores *times* (no paths), which makes the
-    standard helper return ``(None, time)`` and breaks rendering.
-    We work around this by chaining bearings across segments: when
-    ``initial_bearing`` is not None the function skips the matrix
-    shortcut and either hits the path cache or runs a full A*.
-    """
+def _build_path_coords(G, stops, offset=0.0):
+    """Query OSRM directly for the path geometry to skip Python A*."""
     if len(stops) < 2:
         return []
-
-    full_path = []
-    last_bearing = None          # chain across segments
-
-    for i in range(len(stops) - 1):
-        u = stops[i].node_id
-        v = stops[i + 1].node_id
-        if u == v:
-            if not full_path:
-                full_path.append(u)
-            continue
-
-        # Use the turn-aware pathfinder.
-        # Passing initial_bearing (even 0.0 on first call) bypasses
-        # the matrix-only shortcut so we always get an actual path.
-        bearing_arg = last_bearing if last_bearing is not None else 0.0
-        seg, _ = find_shortest_path_with_turns(
-            G, u, v, weight='travel_time', initial_bearing=bearing_arg,
-        )
-
-        if seg is None or len(seg) < 2:
-            # Fallback: plain Dijkstra (at least draws *something*)
-            try:
-                seg = nx.shortest_path(G, u, v, weight='travel_time')
-            except Exception:
-                try:
-                    seg = nx.shortest_path(G, u, v, weight='length')
-                except Exception:
-                    continue
-
-        if not full_path:
-            full_path.extend(seg)
-        else:
-            full_path.extend(seg[1:])
-
-        last_bearing = get_bearing_of_path(G, seg)
-
-    return full_path
-
-
-def _build_path_coords(G, full_path, offset=0.0):
-    """Convert a list of node IDs to (lat, lon) tuples following edge geometries."""
-    coords = []
-    for i in range(len(full_path) - 1):
-        u, v = full_path[i], full_path[i + 1]
-        ed = G.get_edge_data(u, v)
-        if not ed:
-            continue
-        d = ed[0] if 0 in ed else list(ed.values())[0]
-        if "geometry" in d:
-            for lon, lat in d["geometry"].coords:
-                coords.append((lat + offset, lon + offset))
-        else:
-            coords.append((G.nodes[u]["y"] + offset, G.nodes[u]["x"] + offset))
-    last = full_path[-1]
-    coords.append((G.nodes[last]["y"] + offset, G.nodes[last]["x"] + offset))
-    return coords
+    
+    # Format coordinates for OSRM (lon,lat)
+    coords_str = ";".join([f"{s.coords[1]},{s.coords[0]}" for s in stops])
+    url = f"http://localhost:5000/route/v1/driving/{coords_str}?overview=full&geometries=geojson"
+    
+    try:
+        resp = requests.get(url).json()
+        if resp.get("code") == "Ok":
+            geom = resp["routes"][0]["geometry"]["coordinates"]
+            # OSRM returns [lon, lat], Folium expects [lat, lon]
+            return [(lat + offset, lon + offset) for lon, lat in geom]
+    except Exception:
+        pass
+        
+    # Fallback if OSRM is unreachable: draw straight lines between stops
+    return [(s.coords[0] + offset, s.coords[1] + offset) for s in stops]
 
 
 def _build_walk_coords(G, wp):

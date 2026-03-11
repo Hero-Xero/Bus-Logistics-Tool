@@ -3,3 +3,4 @@ folium
 scikit-learn
 geopy
 filprofiler
+numpy
