@@ -20,13 +20,14 @@ def calc_max_walk_distance(school_stage):
 
 class Student:  
     def __init__(self, id, lat, lon, age, school_stage, fee,
-                 assignment="permanent", valid_from=None, valid_until=None):
+                 assignment="permanent", valid_from=None, valid_until=None,
+                 walk_radius=None):
         self.id = id
         self.coords = (lat, lon)          # home location
         self.age = age
         self.school_stage = school_stage
         self.fee = fee
-        self.walk_radius = calc_max_walk_distance(school_stage)
+        self.walk_radius = walk_radius if walk_radius is not None else calc_max_walk_distance(school_stage)
         self.assigned_stop = None
         self.is_served = False
         self.failure_reason = ""

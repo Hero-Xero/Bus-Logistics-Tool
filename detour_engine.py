@@ -1126,100 +1126,102 @@ def validate_permanent_student(new_stop, route, insert_position, delta_time_minu
     """
     # Check 1: Bus capacity
     if route.get_student_count() >= route.bus.capacity:
-        return False, route.total_time, f"Bus at capacity ({route.get_student_count()}/{route.bus.capacity})"
+        return False, route.total_time, "Bus at capacity"
 
-    school_node  = route.stops[-1].node_id
-    k            = getattr(route, 'ride_time_multiplier', 2.5)
-    floor_min    = getattr(route, 'floor_minutes',        45)
-    ceiling_min  = getattr(route, 'ceiling_minutes',      60)  # extra minutes over direct
+    school_node = route.stops[-1].node_id
+    k = getattr(route, 'ride_time_multiplier', 2.5)
+    floor_min = getattr(route, 'floor_minutes', 45)
+    ceiling_min = getattr(route, 'ceiling_minutes', 60)
 
-    # Fast-exit for unconstrained / benchmark mode: skip all ride-time checks.
-    # When multiplier >= 100 and floor >= 999, no real cap exists; avoid O(N^2) work.
     if k >= 100 and floor_min >= 999:
         return True, 0.0, "Unconstrained accepted"
 
-    # Check 2: New student's personal ride-time cap (bidirectional fairness rule)
-    # A route is only rejected for ride time if the constraint is broken in BOTH
-    # the morning (home→school) AND the afternoon (school→home reversed route).
-    new_student_ride_time = calculate_student_ride_time_potential(route, new_stop, insert_position, graph)
+    bidir = getattr(route, 'bidirectional_check', True)
 
-    bidir          = getattr(route, 'bidirectional_check',      True)
+    u_node = route.stops[insert_position - 1].node_id
+    v_node = route.stops[insert_position].node_id
+    new_node = new_stop.node_id
 
-    if new_student is not None:
-        morning_cap = compute_student_tmax(new_student, school_node, graph, k, floor_min, ceiling_min)
-        t_direct    = compute_direct_time(new_student, school_node, graph)
-        am_violated = new_student_ride_time > morning_cap
-
-        if am_violated:
-            if not bidir:
-                # Strict one-direction check — reject immediately
-                return (False, new_student_ride_time,
-                        f"AM ride cap exceeded: "
-                        f"{new_student_ride_time:.1f}>{morning_cap:.1f} min "
-                        f"(direct={t_direct:.1f}, clamp({k}\u00d7, {floor_min}, +{ceiling_min}))")
-            # Bidirectional leniency: only reject if PM is also too long
-            pm_ride    = calculate_afternoon_ride_time_potential(route, new_stop, insert_position, graph)
-            pm_violated = pm_ride > morning_cap
-            if pm_violated:
-                return (False, new_student_ride_time,
-                        f"Ride cap exceeded in both directions — AM {new_student_ride_time:.1f} "
-                        f"PM {pm_ride:.1f} > {morning_cap:.1f} min")
-            # AM violated but PM is within cap → accept under bidirectional leniency
+    # 1. Calculate the Afternoon (PM) Detour Delta instantly
+    pm_v_to_new = _MATRIX_CACHE.get((v_node, new_node), float('inf'))
+    pm_new_to_u = _MATRIX_CACHE.get((new_node, u_node), float('inf'))
+    pm_v_to_u = _MATRIX_CACHE.get((v_node, u_node), float('inf'))
+    
+    if pm_v_to_new == float('inf') or pm_new_to_u == float('inf'):
+        pm_delta = float('inf')
     else:
-        # Fallback: flat route_tmax
-        if new_student_ride_time > route.route_tmax:
-            return (False, new_student_ride_time,
-                    f"Student ride time exceeds Tmax: {new_student_ride_time:.1f} > {route.route_tmax} min")
+        if pm_v_to_u == float('inf'):
+            pm_v_to_u = 0 
+        pm_delta = (pm_v_to_new + pm_new_to_u) - pm_v_to_u
 
-    # Check 3: Existing students whose morning ride increases due to this insertion.
-    # Check 3: Existing students whose morning ride increases due to this insertion.
+    # 2. Precompute ALL original AM/PM times using array indices (Zero array allocations in the loops!)
+    am_times = [0.0] * len(route.stops)
+    curr_am = 0.0
+    for i in range(len(route.stops) - 1, -1, -1):
+        am_times[i] = curr_am
+        if i > 0:
+            curr_am += _MATRIX_CACHE.get((route.stops[i-1].node_id, route.stops[i].node_id), float('inf'))
+            
+    pm_order = [route.stops[-1]] + route.stops[1:-1][::-1] + [route.stops[0]]
+    pm_times = [0.0] * len(pm_order)
+    curr_pm = 0.0
+    for i in range(len(pm_order)):
+        pm_times[i] = curr_pm
+        if i < len(pm_order) - 1:
+            curr_pm += _MATRIX_CACHE.get((pm_order[i].node_id, pm_order[i+1].node_id), float('inf'))
+
+    # 3. Check the NEW student's time
+    am_new_to_v = _MATRIX_CACHE.get((new_node, v_node), float('inf'))
+    new_student_am = am_new_to_v + am_times[insert_position]
+
     if new_student is not None:
-        # --- SUPER OPTIMIZATION: O(1) Ride Time Check ---
-        # Precompute the current time from each stop to the school ONCE (O(N) instead of O(N^3))
-        old_ride_times = {}
-        accumulated = 0.0
-        if route.stops:
-            for i in range(len(route.stops) - 1, 0, -1):
-                u = route.stops[i-1].node_id
-                v = route.stops[i].node_id
-                t = _MATRIX_CACHE.get((u, v), float('inf'))
-                accumulated += t
-                old_ride_times[route.stops[i-1]] = accumulated
-
-        for stop in route.stops:
-            if stop.stop_type == 'school':
-                continue
+        t_d = compute_direct_time(new_student, school_node, graph)
+        if t_d != float('inf') and t_d > 0:
+            morning_cap = max(floor_min, min(k * t_d, t_d + ceiling_min))
+            if new_student_am > morning_cap:
+                if not bidir:
+                    return False, new_student_am, "AM cap exceeded"
                 
-            stop_idx = route.stops.index(stop) if stop in route.stops else -1
-            if stop_idx == -1 or stop_idx >= insert_position:
-                continue  # boards AFTER new stop — morning ride unaffected
+                # Check PM time (School -> ... -> v_node -> new_stop)
+                pm_idx_of_v = len(route.stops) - 1 - insert_position
+                pm_school_to_v = pm_times[pm_idx_of_v]
+                new_student_pm = pm_school_to_v + pm_v_to_new
+                
+                if new_student_pm > morning_cap:
+                    return False, new_student_am, "Cap exceeded in AM and PM"
+    else:
+        if new_student_am > route.route_tmax:
+            return False, new_student_am, "Exceeds route Tmax"
 
-            # The new ride time is simply their exact old ride time + the detour delta
-            old_ride_time = old_ride_times.get(stop, float('inf'))
-            morning_ride_check = old_ride_time + delta_time_minutes
+    # 4. Check the EXISTING students instantly by adding the deltas
+    for i, stop in enumerate(route.stops):
+        if stop.stop_type == 'school' or not stop.students:
+            continue
+        
+        # Students picked up BEFORE the insertion experience the delay in BOTH directions
+        is_before = (i < insert_position)
+        if not is_before:
+            continue
+            
+        new_am = am_times[i] + delta_time_minutes
+        pm_idx = len(route.stops) - 1 - i
+        new_pm = pm_times[pm_idx] + pm_delta
 
-            for existing_student in stop.students:
-                t_d = compute_direct_time(existing_student, school_node, graph)
-                if t_d == float('inf') or t_d <= 0:
-                    continue
-                    
-                ex_floor   = getattr(existing_student, 'floor_minutes',   floor_min)
-                ex_ceiling = getattr(existing_student, 'ceiling_minutes', ceiling_min)
-                existing_cap = max(ex_floor, min(k * t_d, t_d + ex_ceiling))
+        for st in stop.students:
+            t_d = compute_direct_time(st, school_node, graph)
+            if t_d == float('inf') or t_d <= 0: continue
+            
+            ex_floor = getattr(st, 'floor_minutes', floor_min)
+            ex_ceil = getattr(st, 'ceiling_minutes', ceiling_min)
+            cap = max(ex_floor, min(k * t_d, t_d + ex_ceil))
+            
+            if new_am > cap:
+                if not bidir:
+                    return False, new_student_am, f"Pushes {st.id} over AM cap"
+                if new_pm > cap:
+                    return False, new_student_am, f"Pushes {st.id} over AM and PM cap"
 
-                if morning_ride_check > existing_cap:
-                    if not bidir:
-                        return (False, morning_ride_check,
-                                f"Insertion pushes {existing_student.id} over AM cap")
-                    
-                    # Bidirectional: check PM for this existing student
-                    pm_ride_ex  = calculate_afternoon_ride_time_potential(
-                        route, new_stop, insert_position, graph, target_stop=stop)
-                    if pm_ride_ex > existing_cap:
-                        return (False, morning_ride_check,
-                                f"Insertion pushes {existing_student.id} over cap in both directions")
-
-    return True, new_student_ride_time, "Permanent student accepted"
+    return True, new_student_am, "Accepted"
     
     # if new_student is not None:
     #     for stop in route.stops:

@@ -92,6 +92,11 @@ def main():
             "Defaults to input.json in this folder."
         ),
     )
+    parser.add_argument(
+        "--iterations",
+        type=int,
+        help="Override iteration count from config file",
+    )
     args = parser.parse_args()
 
     input_path = os.path.abspath(args.input)
@@ -122,6 +127,7 @@ def main():
     _run_comparison(
         input_path=dest_input,
         output_path=output_path,
+        iterations=args.iterations,
     )
 
 

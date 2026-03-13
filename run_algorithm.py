@@ -253,7 +253,8 @@ def run_generate_routes(data, G, input_file_path):
 
 def run_algorithm(data: dict, G, iterations: int = None,
                   stage_walk_limits: dict = None, save=False,
-                  G_drive=None, time_budget_seconds: float = None):
+                  G_drive=None, time_budget_seconds: float = None,
+                  unconstrained=False):
     """Run ALNS on *data* using graph *G* and return (best_solution, stats_dict, school_coords).
 
     Parameters
@@ -267,6 +268,7 @@ def run_algorithm(data: dict, G, iterations: int = None,
     stage_walk_limits : dict – override walk limits *after* students are created
                                e.g. {"KG": 0, "MIDDLE": 150, "HIGH": 200}
     save : bool            – persist run artefacts to runs_history/
+    unconstrained : bool   – if True, ignore safety constraints during walking-stop search.
 
     Returns
     -------
@@ -275,16 +277,12 @@ def run_algorithm(data: dict, G, iterations: int = None,
     if G_drive is None:
         G_drive = G
     import time as _time
+    meta = data.get("meta", {})
     students, buses, routes, school_coords, constraints, algo_cfg = load_mode1_input(data, G)
 
     # Apply stage-specific walk limits if provided
-    if stage_walk_limits:
-        _stage_map = {
-            "KG":         School_Stage.KG,
-            "ELEMENTARY": School_Stage.ELEMENTARY,
-            "MIDDLE":     School_Stage.MIDDLE,
-            "HIGH":       School_Stage.HIGH,
-        }
+    # CRITICAL: If mode is door_to_door, do NOT override.
+    if stage_walk_limits and meta.get("mode") != "door_to_door":
         for s in students:
             stage_name = s.school_stage.name
             if stage_name in stage_walk_limits:
@@ -298,7 +296,7 @@ def run_algorithm(data: dict, G, iterations: int = None,
 
     initial = ServiceSolution(students, routes, G_drive)
     engine  = ALNSEngine(initial, iterations=iters, time_budget_seconds=budget,
-                         max_candidates_per_student=max_cands)
+                         max_candidates_per_student=max_cands, unconstrained=unconstrained)
     t0      = _time.time()
     best    = engine.run()
     elapsed = _time.time() - t0
@@ -312,6 +310,29 @@ def run_algorithm(data: dict, G, iterations: int = None,
         r.total_time = t if t is not None else 0.0
         d = calculate_route_distance_from_matrix(r.stops, G_drive)
         r.total_distance = d if d is not None else 0.0
+
+    # Calculate individual student ride times for the report
+    from detour_engine import _MATRIX_CACHE, compute_direct_time
+    school_node = best.routes[0].stops[-1].node_id if best.routes else None
+    
+    for r in best.routes:
+        # Precompute AM times for the route
+        n_stops = len(r.stops)
+        am_times = [0.0] * n_stops
+        curr_am = 0.0
+        for i in range(n_stops - 1, -1, -1):
+            am_times[i] = curr_am
+            if i > 0:
+                am_times[i] = curr_am
+                curr_am += _MATRIX_CACHE.get((r.stops[i-1].node_id, r.stops[i].node_id), 0.0)
+        
+        for i, stop in enumerate(r.stops):
+            if stop.stop_type == 'school': continue
+            for s in stop.students:
+                # Ride time = Time from boarding stop to school
+                # In the report, we store the morning ride time
+                s.ride_time_min = am_times[i]
+                s.direct_time_to_school = compute_direct_time(s, school_node, G_drive)
 
     served = sum(1 for s in best.students if s.is_served)
     total  = len(best.students)
@@ -333,7 +354,8 @@ def run_algorithm(data: dict, G, iterations: int = None,
 
 def find_minimum_fleet(data: dict, G, iterations: int = None,
                        stage_walk_limits: dict = None,
-                       G_drive=None, time_budget_seconds: float = None):
+                       G_drive=None, time_budget_seconds: float = None,
+                       unconstrained=False):
     """Search for the smallest fleet size that can serve every student.
 
     Iterates from the theoretical minimum number of buses (⌈students/capacity⌉)
@@ -347,6 +369,7 @@ def find_minimum_fleet(data: dict, G, iterations: int = None,
                     select fleet size.
     G / G_drive   – passed through to :func:`run_algorithm`.
     iterations, stage_walk_limits, time_budget_seconds – passed through.
+    unconstrained : bool – passed through.
 
     Returns
     -------
@@ -381,6 +404,7 @@ def find_minimum_fleet(data: dict, G, iterations: int = None,
             stage_walk_limits=stage_walk_limits,
             G_drive=G_drive,
             time_budget_seconds=time_budget_seconds,
+            unconstrained=unconstrained,
         )
 
         served  = stats["served"]

@@ -132,12 +132,15 @@ def _relax_ride_constraints(d):
 
 def _make_constrained(data):
     """Mode A: safety constraints ON, ride-time constraints from meta.json."""
-    return copy.deepcopy(data)
+    d = copy.deepcopy(data)
+    d["meta"]["mode"] = "constrained"
+    return d
 
 
 def _make_unconstrained(data):
     """Mode B: all-safe walking, ride-time constraints from meta.json."""
     d = copy.deepcopy(data)
+    d["meta"]["mode"] = "unconstrained"
     for s in d["data"]["students"]:
         s["walk_radius_override"] = 400
     return d
@@ -146,6 +149,7 @@ def _make_unconstrained(data):
 def _make_door_to_door(data):
     """Mode C: no walking (walk_radius=0), ride-time constraints from meta.json."""
     d = copy.deepcopy(data)
+    d["meta"]["mode"] = "door_to_door"
     for s in d["data"]["students"]:
         s["walk_radius_override"] = 0
     return d
@@ -342,6 +346,8 @@ def _compute_route_path(G, stops):
     return stops
 
 
+_OSRM_GEOM_CACHE = {}
+
 def _build_path_coords(G, stops, offset=0.0):
     """Query OSRM directly for the path geometry to skip Python A*."""
     if len(stops) < 2:
@@ -349,12 +355,19 @@ def _build_path_coords(G, stops, offset=0.0):
     
     # Format coordinates for OSRM (lon,lat)
     coords_str = ";".join([f"{s.coords[1]},{s.coords[0]}" for s in stops])
+    
+    if coords_str in _OSRM_GEOM_CACHE:
+        geom = _OSRM_GEOM_CACHE[coords_str]
+        return [(lat + offset, lon + offset) for lon, lat in geom]
+
     url = f"http://localhost:5000/route/v1/driving/{coords_str}?overview=full&geometries=geojson"
     
     try:
+        import requests
         resp = requests.get(url).json()
         if resp.get("code") == "Ok":
             geom = resp["routes"][0]["geometry"]["coordinates"]
+            _OSRM_GEOM_CACHE[coords_str] = geom
             # OSRM returns [lon, lat], Folium expects [lat, lon]
             return [(lat + offset, lon + offset) for lon, lat in geom]
     except Exception:
@@ -393,10 +406,9 @@ def _compute_pm_ride_time(route, stop, G):
     for i in range(target_idx):
         u = afternoon[i].node_id
         v = afternoon[i + 1].node_id
-        t = _MATRIX_CACHE.get((u, v), None)
-        if t is None:
-            _, t = find_shortest_path_with_turns(G, u, v)
-        if not math.isfinite(t):
+        # Use matrix cache
+        t = _MATRIX_CACHE.get((u, v), float('inf'))
+        if t >= 9999:
             return float('inf')
         total += t
     return total
@@ -525,13 +537,14 @@ def _add_route_layer(m, G, sol, mode_key, G_con, constraints=None):
                 direct_am = None
                 direct_pm = None
                 try:
-                    _, direct_am = find_shortest_path_with_turns(G, s_node, school_node, weight='travel_time')
+                    direct_am = compute_direct_time(student, school_node, G)
                     if not math.isfinite(direct_am):
                         direct_am = None
                 except Exception:
                     pass
                 try:
-                    _, direct_pm = find_shortest_path_with_turns(G, school_node, s_node, weight='travel_time')
+                    from detour_engine import compute_afternoon_direct_time
+                    direct_pm = compute_afternoon_direct_time(student, school_node, G)
                     if not math.isfinite(direct_pm):
                         direct_pm = None
                 except Exception:
@@ -935,7 +948,7 @@ def _build_custom_layer_control_js(
 
 
 def _build_stats_html(all_stats, crossings_dict, occupancies_dict,
-                      solutions_dict=None, G=None, constraints=None):
+                      solutions_dict=None, G=None, constraints=None, meta=None):
     now    = datetime.datetime.now()
     hour12 = now.hour % 12 or 12
     ampm   = "am" if now.hour < 12 else "pm"
@@ -985,7 +998,7 @@ def _build_stats_html(all_stats, crossings_dict, occupancies_dict,
           <table style="width:100%; border-collapse:collapse;
                         font-size:11px; text-align:center;">
             <tr style="color:#555;">
-              <td style="text-align:left; padding:1px 4px;">Routes</td>
+              <td style="text-align:left; padding:1px 4px;">Buses</td>
               <td style="text-align:left; padding:1px 4px;">Total Time</td>
               <td style="text-align:left; padding:1px 4px;">Distance</td>
               <td style="text-align:left; padding:1px 4px;">Avg Occ.</td>
@@ -994,7 +1007,7 @@ def _build_stats_html(all_stats, crossings_dict, occupancies_dict,
               <td style="text-align:left; padding:1px 4px;">Crossings</td>
             </tr>
             <tr style="font-weight:bold;">
-              <td style="padding:1px 4px;">{s['routes']}</td>
+              <td style="padding:1px 4px; white-space:nowrap;">{s['routes']} / {meta.get("buses", {}).get("count", "—")}</td>
               <td style="padding:1px 4px;">{s['total_time']:.0f} min</td>
               <td style="padding:1px 4px;">{s['total_dist']:.1f} km</td>
               <td style="padding:1px 4px;">{avg_occ_str}</td>
@@ -1059,9 +1072,10 @@ def _build_stats_html(all_stats, crossings_dict, occupancies_dict,
       </div>"""
 
     return f"""
-    <div style="position:fixed; bottom:15px; right:15px; width:430px;
-                max-height:260px; overflow-y:auto;
+    <div style="position:fixed; bottom:15px; right:15px; width:480px;
+                max-height:calc(100vh - 80px); overflow-y:auto;
                 background:white; border:2px solid #555; z-index:9999;
+
                 padding:12px 14px; border-radius:6px; font-size:12px;
                 font-family:Arial,sans-serif; box-shadow:2px 2px 8px rgba(0,0,0,.25);">
       <div style="font-weight:bold; font-size:13px; margin-bottom:10px;
@@ -1410,10 +1424,12 @@ def run(input_path=None, output_path=None, iterations=None):
     if minimize_buses:
         print("  [FleetSearch] minimize_buses=True — searching minimum fleet for Mode A")
         _, sol_a, stats_a, school_a = find_minimum_fleet(
-            data_a, G_con, iterations=iters, stage_walk_limits=stage_walk, G_drive=G_unc)
+            data_a, G_con, iterations=iters, stage_walk_limits=stage_walk, G_drive=G_unc,
+            unconstrained=False)
     else:
         sol_a, stats_a, school_a = run_algorithm(
-            data_a, G_con, iterations=iters, stage_walk_limits=stage_walk, G_drive=G_unc)
+            data_a, G_con, iterations=iters, stage_walk_limits=stage_walk, G_drive=G_unc,
+            unconstrained=False)
     stats_a["label"] = "Mode-A"
     # Snapshot candidate data before caches are cleared for next mode
     cands_a    = {sid: list(v) for sid, v in _alns._student_candidate_cache.items()}
@@ -1439,9 +1455,10 @@ def run(input_path=None, output_path=None, iterations=None):
     if minimize_buses:
         print("  [FleetSearch] minimize_buses=True — searching minimum fleet for Mode B")
         _, sol_b, stats_b, school_b = find_minimum_fleet(
-            data_b, G_unc, iterations=iters, G_drive=G_unc)
+            data_b, G_unc, iterations=iters, G_drive=G_unc, unconstrained=True)
     else:
-        sol_b, stats_b, school_b = run_algorithm(data_b, G_unc, iterations=iters, G_drive=G_unc)
+        sol_b, stats_b, school_b = run_algorithm(data_b, G_unc, iterations=iters, G_drive=G_unc,
+                                                 unconstrained=True)
     stats_b["label"] = "Mode-B"
     cands_b    = {sid: list(v) for sid, v in _alns._student_candidate_cache.items()}
     cand_dist_b = {sid: dict(v) for sid, v in _alns._student_candidate_dist.items()}
@@ -1465,9 +1482,10 @@ def run(input_path=None, output_path=None, iterations=None):
     if minimize_buses:
         print("  [FleetSearch] minimize_buses=True — searching minimum fleet for Mode C")
         _, sol_c, stats_c, school_c = find_minimum_fleet(
-            data_c, G_unc, iterations=iters, G_drive=G_unc)
+            data_c, G_unc, iterations=iters, G_drive=G_unc, unconstrained=False)
     else:
-        sol_c, stats_c, school_c = run_algorithm(data_c, G_unc, iterations=iters, G_drive=G_unc)
+        sol_c, stats_c, school_c = run_algorithm(data_c, G_unc, iterations=iters, G_drive=G_unc,
+                                                 unconstrained=False)
     stats_c["label"] = "Mode-C"
     cands_c    = {sid: list(v) for sid, v in _alns._student_candidate_cache.items()}
     cand_dist_c = {sid: dict(v) for sid, v in _alns._student_candidate_dist.items()}
@@ -1573,7 +1591,8 @@ def run(input_path=None, output_path=None, iterations=None):
         _build_stats_html(all_stats, crossings_dict, occupancies_dict,
                           solutions_dict={"A": sol_a, "B": sol_b, "C": sol_c},
                           G=G_unc,
-                          constraints=meta.get("constraints", {}))))
+                          constraints=meta.get("constraints", {}),
+                          meta=meta)))
 
     m.save(output)
     fsize_kb = os.path.getsize(output) / 1024
@@ -1598,14 +1617,18 @@ def run(input_path=None, output_path=None, iterations=None):
     print("\n" + "=" * 60)
     print("  COMPARISON SUMMARY")
     print("=" * 60)
-    hdr = f"{'Mode':<30} {'Routes':>6} {'Time':>8} {'Dist':>8} {'Served':>8} {'Crossings':>10} {'Wall(s)':>8}"
+    
+    total_buses_given = meta.get("buses", {}).get("count", 0)
+    hdr = f"{'Mode':<30} {'Buses':>10} {'Time':>8} {'Dist':>8} {'Served':>8} {'Crossings':>10} {'Wall(s)':>8}"
     print(hdr)
     print("-" * len(hdr))
     for mk in _active_modes:
         s  = all_stats[mk]
         cx = len(crossings_dict.get(mk, []))
         wt = _mode_wall_times.get(mk, 0)
-        print(f"{_MODE_NAMES[mk]:<30} {s['routes']:>6} {s['total_time']:>8.1f} "
+        # Display as "Used / Given"
+        buses_str = f"{s['routes']}/{total_buses_given}"
+        print(f"{_MODE_NAMES[mk]:<30} {buses_str:>10} {s['total_time']:>8.1f} "
               f"{s['total_dist']:>8.1f} {s['served']}/{s['total']:>5} {cx:>10} {wt:>8.1f}")
     if _skipped:
         for mk in _skipped:

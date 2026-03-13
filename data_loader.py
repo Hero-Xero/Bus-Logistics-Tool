@@ -63,10 +63,9 @@ def _create_students(student_data_list):
             fee=data.get('fee', 100.0),
             assignment=data.get('assignment', 'permanent'),
             valid_from=data.get('valid_from'),
-            valid_until=data.get('valid_until')
+            valid_until=data.get('valid_until'),
+            walk_radius=data.get('walk_radius_override')
         )
-        if 'walk_radius_override' in data:
-            student.walk_radius = data['walk_radius_override']
         students.append(student)
     return students
 
@@ -81,6 +80,8 @@ def _unpack_input(data):
         raise ValueError("Input file must have top-level 'meta' and 'data' fields.")
     return data['meta'], data['data']
 
+
+_SCHOOL_NODE_CACHE = {}
 
 def load_mode1_input(data, G):
     """Load Mode 1 (generate_routes) input.
@@ -106,6 +107,17 @@ def load_mode1_input(data, G):
     constraints = meta.get('constraints', {})
     algo_config = meta.get('algorithm', {'method': 'alns', 'iterations': 60})
 
+    # Cache school node lookup to avoid repeated expensive spatial tree queries
+    cache_key = (school_coords['latitude'], school_coords['longitude'], id(G))
+    if cache_key in _SCHOOL_NODE_CACHE:
+        school_node, school_node_lat, school_node_lon = _SCHOOL_NODE_CACHE[cache_key]
+    else:
+        import detour_engine as _det
+        school_node = _det.fast_nearest_node(G, school_coords['longitude'], school_coords['latitude'])
+        school_node_lat = G.nodes[school_node]['y']
+        school_node_lon = G.nodes[school_node]['x']
+        _SCHOOL_NODE_CACHE[cache_key] = (school_node, school_node_lat, school_node_lon)
+
     # Per-student ride-time constraints — tiered: clamp(k*T_direct, floor, ceiling)
     ride_time_multiplier = constraints.get('ride_time_multiplier', 2.5)
     floor_minutes        = constraints.get('floor_minutes',        45)
@@ -116,12 +128,6 @@ def load_mode1_input(data, G):
     
     # Create one route per bus, each starting with school start/end stops
     routes = []
-    
-    # Snap school ONCE (not per bus) — use BallTree if already built
-    import detour_engine as _det
-    school_node = _det.fast_nearest_node(G, school_coords['longitude'], school_coords['latitude'])
-    school_node_lat = G.nodes[school_node]['y']
-    school_node_lon = G.nodes[school_node]['x']
     
     for i, (bus_id, bus) in enumerate(buses.items()):
         route = Route(

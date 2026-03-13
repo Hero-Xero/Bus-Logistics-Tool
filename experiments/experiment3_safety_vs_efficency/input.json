@@ -27,7 +27,7 @@
   },
 
   "buses": {
-    "count": 4,
+    "count": 3,
     "capacity": 22
   },
 
@@ -44,9 +44,9 @@
 
   "algorithm": {
     "iterations": 60,
-    "time_budget_seconds": 60,
+    "time_budget_seconds": 30,
     "_comment_budget": "Each mode runs until time_budget_seconds of wall-clock time is used (or iterations is hit first, whichever comes first). Ensures all three modes get equal search effort.",
-    "max_candidates_per_student": 4,
+    "max_candidates_per_student": 3,
     "_comment_candidates": "How many walk-radius candidate stops to evaluate per student. Candidates are ranked: home snap always first, then other nodes sorted by (-intersection_or_arterial_points, walk_distance). Higher values explore more stops but slow down each insertion evaluation.",
     "minimize_buses": true,
     "_comment_minimize": "If true, run_comparison calls find_minimum_fleet() for each mode, iterating fleet sizes from the theoretical minimum up to buses.count until all students are served. Disabled by default as it multiplies run time by fleet-search depth."

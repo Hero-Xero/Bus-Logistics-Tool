@@ -3,508 +3,248 @@ import math
 import time
 import numpy as np
 import copy
+import networkx as nx
 from detour_engine import (
-    cheapest_insertion, 
-    calculate_route_time, 
-    calculate_route_distance,
-    calculate_stops_time,
-    calculate_insertion_cost,
-    validate_permanent_student,
-    snap_address_to_edge,
     calculate_route_time_from_matrix,
     calculate_route_distance_from_matrix,
+    snap_address_to_edge,
     calculate_walk_penalty,
-    get_walk_absolute_max
+    get_walk_absolute_max,
+    _MATRIX_CACHE,
+    _get_walk_graph,
+    find_safe_nodes_within_radius
 )
 from entities import Stop
 
+_student_candidate_cache = {}
+_student_candidate_dist = {}
+_fast_walk_cache = {}
 
-import detour_engine
-import solution_state
-
-# --- COMBINATORIAL EXPLOSION KILLER ---
-_FAST_WALK_CACHE = {}
-_ORIGINAL_WALK = detour_engine.calculate_walk_penalty
-
-def _blazing_fast_walk_penalty(student, node_id, graph):
-    key = (student.id, node_id)
-    if key not in _FAST_WALK_CACHE:
-        _FAST_WALK_CACHE[key] = _ORIGINAL_WALK(student, node_id, graph)
-    return _FAST_WALK_CACHE[key]
-
-# Intercept all slow calls across all files instantly
-detour_engine.calculate_walk_penalty = _blazing_fast_walk_penalty
-solution_state.calculate_walk_penalty = _blazing_fast_walk_penalty
-calculate_walk_penalty = _blazing_fast_walk_penalty
-# ---------------------------------------
+def _blazing_fast_walk_penalty(student, node_id, graph, unconstrained=False):
+    key = (student.id, node_id, unconstrained)
+    if key not in _fast_walk_cache:
+        p, m, over = calculate_walk_penalty(student, node_id, graph)
+        if unconstrained and p == float('inf') and m <= get_walk_absolute_max(student.walk_radius):
+            p = 0.0 
+        _fast_walk_cache[key] = (p, m, over)
+    return _fast_walk_cache[key]
 
 # ============================================================================
 # DESTROY OPERATORS
 # ============================================================================
 
 def random_removal(solution, n):
-    """Removes n random students from the solution."""
-    served_students = [s for s in solution.students if s.is_served]
-    n = min(n, len(served_students))
-    if n == 0:
-        return []
-    
-    removed = random.sample(served_students, n)
-    for student in removed:
-        _remove_student_from_solution(solution, student)
+    served = [s for s in solution.students if s.is_served]
+    n = min(n, len(served))
+    if n == 0: return []
+    removed = random.sample(served, n)
+    for s in removed: _remove_student(solution, s)
     return removed
 
 def worst_cost_removal(solution, n):
-    """Removes students who add the most travel time to their routes."""
-    served_students = [s for s in solution.students if s.is_served]
-    n = min(n, len(served_students))
-    if n == 0:
-        return []
-
-    removal_candidates = []
-    for student in served_students:
-        stop = student.assigned_stop
+    served = [s for s in solution.students if s.is_served]
+    n = min(n, len(served))
+    if n == 0: return []
+    costs = []
+    for s in served:
+        stop = s.assigned_stop
         route = next((r for r in solution.routes if stop in r.stops), None)
-        
-        if not route:
-            continue
-            
-        old_time = route.total_time
-        
-        # Calculate time saved if this student is removed
-        temp_stops = list(route.stops)
-        # Find the correct stop in temp_stops (since they were cloned)
-        current_stop = next((s for s in temp_stops if s.node_id == stop.node_id), None)
-        
-        if current_stop:
-            # We want to know the time of the route WITHOUT this specific student
-            # If they are the only student at the stop, the stop is removed
-            if len(current_stop.students) <= 1:
-                temp_stops.remove(current_stop)
-            
-            # Use fast matrix lookup (lazy: computes on cache miss)
-            new_time = calculate_route_time_from_matrix(temp_stops, solution.graph)
-            if new_time is None:
-                new_time = calculate_stops_time(temp_stops, solution.graph)
-            delta_time = old_time - new_time
-            removal_candidates.append((student, delta_time))
-    
-    # Sort by time saved (highest first)
-    removal_candidates.sort(key=lambda x: x[1], reverse=True)
-    removed = [c[0] for c in removal_candidates[:n]]
-    
-    for student in removed:
-        _remove_student_from_solution(solution, student)
+        if not route: continue
+        old_t = route.total_time
+        # Time of route without this student
+        temp_stops = [st for st in route.stops if st != stop or len(st.students) > 1]
+        new_t = calculate_route_time_from_matrix(temp_stops, solution.graph)
+        costs.append((s, old_t - (new_t if new_t is not None else old_t)))
+    costs.sort(key=lambda x: x[1], reverse=True)
+    removed = [c[0] for c in costs[:n]]
+    for s in removed: _remove_student(solution, s)
     return removed
 
-def route_merge_removal(solution, n):
-    """Empties the least-populated active route so ALNS must consolidate
-    its students into the remaining routes.  Drives fleet reduction without
-    changing the number of Route objects in the solution."""
-    active = [r for r in solution.routes
-              if r.get_student_count() > 0]
-    if len(active) < 2:
-        return []
-    # Target the route with the fewest students (easiest to absorb)
-    active.sort(key=lambda r: r.get_student_count())
-    target = active[0]
-    removed = []
-    for stop in list(target.stops):
-        if stop.stop_type == 'school':
-            continue
-        for student in list(stop.students):
-            _remove_student_from_solution(solution, student)
-            removed.append(student)
-    return removed
-
-def _remove_student_from_solution(solution, student):
-    """Helper to safely decouple student from stop and route."""
+def _remove_student(solution, student):
     stop = student.assigned_stop
     if not stop: return
-    
     route = next((r for r in solution.routes if stop in r.stops), None)
     if not route: return
-        
     stop.remove_student(student)
-    
-    # If stop becomes empty, remove it from the route entirely
-    if len(stop.students) == 0:
-        route.stops.remove(stop)
-        
-    # Update route metrics after removal (lazy matrix lookup)
-    fast_time = calculate_route_time_from_matrix(route.stops, solution.graph)
-    route.total_time = fast_time if fast_time is not None else float('inf')
-    fast_dist = calculate_route_distance_from_matrix(route.stops, solution.graph)
-    route.total_distance = fast_dist if fast_dist is not None else calculate_route_distance(route, solution.graph)
-
+    if not stop.students: route.stops.remove(stop)
+    t = calculate_route_time_from_matrix(route.stops, solution.graph)
+    route.total_time = t if t is not None else 0.0
 
 # ============================================================================
 # REPAIR OPERATORS
 # ============================================================================
 
-# def greedy_repair(solution):
-#     """Inserts all unassigned students using the cheapest available insertion point."""
-#     unassigned = [s for s in solution.students if not s.is_served]
-#     random.shuffle(unassigned) # Shuffle to provide variation across calls
-    
-#     for student in unassigned:
-#         # Reuse existing logic from detour_engine
-#         result, _ = cheapest_insertion(student, solution.routes, solution.graph, detour_type='permanent')
-#         if result:
-#             _apply_insertion(solution, student, result)
-
-
-def greedy_repair(solution):
-    """
-    Inserts all unassigned students using the cheapest available insertion point.
-    (Redirected to regret_repair(k=1) to force the use of the OSRM Matrix Cache
-    and prevent the legacy A* Death Spiral).
-    """
-    regret_repair(solution, k=1)
-
-def regret_repair(solution, k=2):
-    """Inserts students with the highest 'regret' cost between best and k-best options.
-    Optimized to minimize redundant calculations.
-    """
+def regret_repair(solution, k=2, unconstrained=False):
     unassigned = [s for s in solution.students if not s.is_served]
-    if not unassigned:
-        return
-
-    # 1. Pre-calculate frontage nodes to avoid repeated snapping logic
-    student_frontages = {}
-    for s in unassigned:
-        node_id, coords = snap_address_to_edge(s.coords, solution.graph)
-        student_frontages[s.id] = (node_id, coords)
-
-    # 2. Initial calculation for all unassigned students
-    # student_route_options[student_id][route_id] = list of insertions
-    student_route_options = {}
-    for s in unassigned:
-        student_route_options[s.id] = {}
-        for route in solution.routes:
-            student_route_options[s.id][route.route_id] = _get_insertions_for_route(
-                s, route, solution.graph, student_frontages[s.id]
-            )
+    if not unassigned: return
+    
+    # Pre-calculate options for all unassigned
+    options_map = {s.id: {r.route_id: _get_insertions(s, r, solution.graph, unconstrained) 
+                   for r in solution.routes} for s in unassigned}
 
     while unassigned:
-        best_regret = -1
-        target_student = None
-        target_insertion = None
-        
-        for student in unassigned:
-            # Flatten all valid options across all routes
-            all_options = []
-            for r_id in student_route_options[student.id]:
-                all_options.extend(student_route_options[student.id][r_id])
+        best_regret, target_s, target_ins = -1, None, None
+        for s in unassigned:
+            all_opts = []
+            for r_opts in options_map[s.id].values(): all_opts.extend(r_opts)
+            if not all_opts: continue
+            all_opts.sort(key=lambda x: x['cost'])
             
-            if not all_options:
-                continue
-            
-            all_options.sort(key=lambda x: x['insertion_cost_minutes'])
-            
-            # Regret calculation
-            if len(all_options) >= k:
-                regret = all_options[k-1]['insertion_cost_minutes'] - all_options[0]['insertion_cost_minutes']
-            else:
-                regret = 2000 - all_options[0]['insertion_cost_minutes']
-                
+            regret = (all_opts[k-1]['cost'] - all_opts[0]['cost']) if len(all_opts) >= k else (2000 - all_opts[0]['cost'])
             if regret > best_regret:
-                best_regret = regret
-                target_student = student
-                target_insertion = all_options[0]
+                best_regret, target_s, target_ins = regret, s, all_opts[0]
         
-        if target_student and target_insertion:
-            # Apply insertion
-            affected_route = target_insertion['route']
-            _apply_insertion(solution, target_student, target_insertion)
-            
-            # Remove from unassigned
-            unassigned.remove(target_student)
-            
-            # Update only the affected route's options for all remaining unassigned students
-            for s in unassigned:
-                student_route_options[s.id][affected_route.route_id] = _get_insertions_for_route(
-                    s, affected_route, solution.graph, student_frontages[s.id]
-                )
-        else:
-            break
+        if target_s and target_ins:
+            route = target_ins['route']
+            _apply_ins(solution, target_s, target_ins)
+            unassigned.remove(target_s)
+            # Update only affected route for remaining students
+            for s in unassigned: 
+                options_map[s.id][route.route_id] = _get_insertions(s, route, solution.graph, unconstrained)
+        else: break
 
-# Cache candidate nodes per student (BFS + safe_nodes don't change between iterations)
-_student_candidate_cache = {}  # student_id -> list of (node_id, coords)
-_student_candidate_dist   = {}  # student_id -> {node_id: walk_dist_m}  (0 for frontage)
+def _get_insertions(student, route, graph, unconstrained=False):
+    if route.get_student_count() >= route.bus.capacity: return []
+    candidates = _student_candidate_cache.get(student.id, [])
+    if not candidates: return []
 
-# Candidate configuration set by ALNSEngine before each run (max_candidates_per_student, etc.)
-_alns_candidate_cfg = {}
+    results = []
+    n_stops = len(route.stops)
+    if n_stops < 2: return []
 
-def _get_insertions_for_route(student, route, graph, frontage_info):
-    """Helper to find all possible valid insertion points for a student in ONE route.
-    Tries both the frontage node AND walk/reachability candidates.
-    """
-    from detour_engine import _MATRIX_CACHE
-    options = []
-    frontage_node_id, frontage_coords = frontage_info
-    
-    # Use cached candidates if available (graph doesn't change between iterations)
-    if student.id in _student_candidate_cache:
-        candidate_nodes = _student_candidate_cache[student.id]
-    else:
-        max_k = _alns_candidate_cfg.get("max_candidates_per_student", 15)
-        # Build candidate list: frontage node + walk candidates (if applicable)
-        candidate_nodes = [(frontage_node_id, frontage_coords)]
-        dist_map = {frontage_node_id: 0.0}  # node_id -> walk distance (metres)
-        
-        if student.walk_radius > 0:
-            from detour_engine import find_safe_nodes_within_radius
-            # Pass candidate_cfg so results are scored (intersections/arterials preferred)
-            # and already returned in (-points, dist) order.
-            cand_cfg = _alns_candidate_cfg if _alns_candidate_cfg else None
-            safe_nodes = find_safe_nodes_within_radius(
-                student.coords, graph, 500, student.walk_radius, candidate_cfg=cand_cfg
-            )
-            for node_id, dist in safe_nodes:  # already sorted by scoring function
-                if node_id != frontage_node_id:
-                    coords = (graph.nodes[node_id]['y'], graph.nodes[node_id]['x'])
-                    candidate_nodes.append((node_id, coords))
-                    dist_map[node_id] = float(dist)
-        
-        # Bus-reachable fallback: if frontage is unreachable, find nearby reachable nodes
-        # via bidirectional BFS (walking ignores one-way constraints)
-        # Bus-reachable fallback: if frontage is unreachable, find nearby reachable nodes
-        # via optimized NetworkX Dijkstra (prevents exponential BFS blowups)
-        # Bus-reachable fallback: NetworkX optimized to prevent BFS infinite loops
-        school_node = route.stops[0].node_id if route.stops else None
-        if school_node:
-            to_school = _MATRIX_CACHE.get((frontage_node_id, school_node), float('inf'))
-            from_school = _MATRIX_CACHE.get((school_node, frontage_node_id), float('inf'))
+    k_r, fl_r, ce_r = getattr(route, 'ride_time_multiplier', 2.5), getattr(route, 'floor_minutes', 45), getattr(route, 'ceiling_minutes', 60)
+    bidir, school_node = getattr(route, 'bidirectional_check', True), route.stops[-1].node_id
+
+    # Precompute AM/PM baseline times
+    am_times = [0.0] * n_stops
+    curr_am = 0.0
+    for i in range(n_stops - 1, -1, -1):
+        am_times[i] = curr_am
+        if i > 0: curr_am += _MATRIX_CACHE.get((route.stops[i-1].node_id, route.stops[i].node_id), 9999.0)
+
+    pm_times = [0.0] * n_stops
+    curr_pm = 0.0
+    pm_order = [route.stops[-1]] + route.stops[1:-1][::-1] + [route.stops[0]]
+    for i in range(n_stops):
+        pm_times[i] = curr_pm
+        if i < n_stops - 1: curr_pm += _MATRIX_CACHE.get((pm_order[i].node_id, pm_order[i+1].node_id), 9999.0)
+
+    from detour_engine import compute_direct_time
+    t_d = compute_direct_time(student, school_node, graph)
+    cap = max(fl_r, min(k_r * t_d, t_d + ce_r)) if t_d < 9999 else 9999.0
+
+    # Pre-calculate caps for existing students on this route to avoid repeated lookups
+    existing_student_caps = []
+    for i, stop in enumerate(route.stops):
+        if stop.stop_type == 'school': continue
+        for st in stop.students:
+            # We need the direct time to calculate their dynamic cap
+            t_direct = compute_direct_time(st, school_node, graph)
+            st_cap = max(fl_r, min(k_r * t_direct, t_direct + ce_r)) if t_direct < 9999 else 9999.0
+            # (boarding_position, current_ride_time, capacity)
+            existing_student_caps.append((i, am_times[i], st_cap))
+
+    for pos in range(1, n_stops):
+        u, v = route.stops[pos-1].node_id, route.stops[pos].node_id
+        dt_old = _MATRIX_CACHE.get((u, v), 9999.0)
+        for nid, coords in candidates:
+            dt1, dt2 = _MATRIX_CACHE.get((u, nid), 9999.0), _MATRIX_CACHE.get((nid, v), 9999.0)
+            if dt1 >= 9999 or dt2 >= 9999: continue
             
-            if to_school == float('inf') or from_school == float('inf'):
-                from detour_engine import fast_nearest_node, _get_walk_graph
-                import networkx as nx
-                
-                lat, lon = student.coords
-                center_node = fast_nearest_node(graph, lon, lat)
-                max_walk = get_walk_absolute_max(student.walk_radius)
-                walk_g = _get_walk_graph(graph)
-                
-                try:
-                    lengths = nx.single_source_dijkstra_path_length(
-                        walk_g, center_node, cutoff=max_walk, weight='length'
-                    )
-                    
-                    for node, dist in sorted(lengths.items(), key=lambda x: x[1]):
-                        if len(candidate_nodes) >= max_k:
-                            break
-                        ts = _MATRIX_CACHE.get((node, school_node), float('inf'))
-                        fs = _MATRIX_CACHE.get((school_node, node), float('inf'))
-                        if ts < float('inf') and fs < float('inf'):
-                            if not any(c[0] == node for c in candidate_nodes):
-                                coords = (graph.nodes[node]['y'], graph.nodes[node]['x'])
-                                candidate_nodes.append((node, coords))
-                                dist_map[node] = float(dist)
-                except Exception:
-                    pass
-    
-    # Start and end stops are fixed (Depot/School), strictly insert between
-    start_pos = 1 if len(route.stops) >= 2 else 0
-    end_pos = len(route.stops) if len(route.stops) >= 2 else len(route.stops) + 1
-    
-    # Pre-filter: only keep candidates with KNOWN bus-reachability (both directions in cache)
-    school_node = route.stops[0].node_id if route.stops else None
-    reachable_candidates = []
-    for cand_node_id, cand_coords in candidate_nodes:
-        if school_node:
-            to_s = _MATRIX_CACHE.get((cand_node_id, school_node), None)
-            from_s = _MATRIX_CACHE.get((school_node, cand_node_id), None)
-            # Skip if not in matrix at all (never precomputed) or known unreachable
-            if to_s is None or from_s is None or to_s == float('inf') or from_s == float('inf'):
-                continue
-        reachable_candidates.append((cand_node_id, cand_coords))
-        
-    for pos in range(start_pos, end_pos):
-        for cand_node_id, cand_coords in reachable_candidates:
-            # Check if an existing stop at this node can be reused
-            existing_stop = next((s for s in route.stops if s.node_id == cand_node_id), None)
-            eval_stop = existing_stop if existing_stop else Stop(cand_node_id, cand_coords[0], cand_coords[1])
+            delta = dt1 + dt2 - dt_old
             
-            res = calculate_insertion_cost(eval_stop, route, pos, graph)
-            if res is None: continue
-            
-            cost, is_valid, _ = res
-            if not is_valid: continue
-            
-            valid, _, _ = validate_permanent_student(eval_stop, route, pos, cost, graph,
-                                                     new_student=student)
-            if valid:
-                # Add walk penalty to insertion cost
-                walk_penalty, walk_m, over_limit = calculate_walk_penalty(
-                    student, cand_node_id, graph
-                )
-                if walk_penalty == float('inf'):
-                    continue  # Beyond absolute walk maximum
-                
-                penalized_cost = cost + walk_penalty
-                options.append({
-                    'route': route,
-                    'new_stop': eval_stop,
-                    'insertion_position': pos,
-                    'insertion_cost_minutes': penalized_cost,
-                    'is_new_stop': existing_stop is None
-                })
-    return options
+            # 1. NEW student comfort check
+            if (dt2 + am_times[pos]) > cap:
+                if not bidir: continue
+                pm_idx_v = n_stops - 1 - pos
+                pm_v_to_new = _MATRIX_CACHE.get((v, nid), 9999.0)
+                if (pm_times[pm_idx_v] + pm_v_to_new) > cap: continue
 
-def _get_all_valid_insertions(student, routes, graph):
-    """Legacy helper (still needed for greedy_repair)"""
-    node_id, coords = snap_address_to_edge(student.coords, graph)
-    all_options = []
-    for route in routes:
-        all_options.extend(_get_insertions_for_route(student, route, graph, (node_id, coords)))
-    return all_options
+            # 2. EXISTING students comfort check (The Domino Effect Fix)
+            too_long = False
+            for board_pos, current_time, st_cap in existing_student_caps:
+                if board_pos < pos: # These students are delayed by the new stop
+                    if (current_time + delta) > st_cap:
+                        too_long = True
+                        break
+            if too_long: continue
 
-def _apply_insertion(solution, student, result):
-    """Actually update the route and student state based on insertion search."""
-    route = result['route']
-    new_stop = result['new_stop']
-    
-    if result.get('is_new_stop', True) and new_stop not in route.stops:
-        route.stops.insert(result['insertion_position'], new_stop)
-    
-    new_stop.add_student(student)
-    # Lazy matrix lookup (computes A* on cache miss)
-    fast_time = calculate_route_time_from_matrix(route.stops, solution.graph)
-    route.total_time = fast_time if fast_time is not None else float('inf')  
-    fast_dist = calculate_route_distance_from_matrix(route.stops, solution.graph)
-    route.total_distance = fast_dist if fast_dist is not None else calculate_route_distance(route, solution.graph)
+            w_pen, _, _ = _blazing_fast_walk_penalty(student, nid, graph, unconstrained)
+            if w_pen == float('inf'): continue
 
+            existing = next((s for s in route.stops if s.node_id == nid), None)
+            results.append({'route': route, 'cost': delta + w_pen, 'pos': pos,
+                'stop': existing if existing else Stop(nid, coords[0], coords[1]), 'is_new': existing is None})
+    return results
+
+def _apply_ins(sol, student, ins):
+    route, stop = ins['route'], ins['stop']
+    if ins['is_new']: route.stops.insert(ins['pos'], stop)
+    stop.add_student(student)
+    t = calculate_route_time_from_matrix(route.stops, sol.graph)
+    route.total_time = t if t is not None else 0.0
 
 # ============================================================================
 # ALNS ENGINE
 # ============================================================================
 
 class ALNSEngine:
-    def __init__(self, initial_solution, iterations=100, temp=1000, cooling=0.98,
-                 time_budget_seconds=None, max_candidates_per_student=None):
-        # Configure module-level candidate settings.
-        # NOTE: do NOT clear _student_candidate_cache here — the cache is
-        # keyed by student-id and stays valid across fleet-search iterations
-        # (same students, same graph, same walk radii).  Clearing is handled
-        # by _reset_caches() in run_comparison.py between MODES, not between
-        # fleet-search k values.
-        global _alns_candidate_cfg
-        _alns_candidate_cfg = {}
-        if max_candidates_per_student is not None:
-            _alns_candidate_cfg["max_candidates_per_student"] = max_candidates_per_student
-
-        self.curr_sol = initial_solution.clone()
-        self.best_sol = initial_solution.clone()
+    def __init__(self, initial_sol, iterations=100, time_budget_seconds=None, max_candidates_per_student=3, unconstrained=False):
+        self.curr_sol = initial_sol.clone()
+        self.best_sol = initial_sol.clone()
         self.iterations = iterations
-        self.temp = temp
-        self.cooling = cooling
-        self.time_budget_seconds = time_budget_seconds  # wall-clock budget (None = use iterations only)
+        self.time_budget_seconds = time_budget_seconds
+        self.unconstrained = unconstrained
+        self.destroy_ops = [random_removal, worst_cost_removal]
         
-        self.destroy_ops = [random_removal, worst_cost_removal, route_merge_removal]
-        self.repair_ops = [greedy_repair, regret_repair]
-        
-        # Weights for operator selection
-        self.d_weights = np.ones(len(self.destroy_ops))
-        self.r_weights = np.ones(len(self.repair_ops))
-        
-        # Reward scores
-        self.s1 = 30 # New global best
-        self.s2 = 15 # Better than current
-        self.s3 = 5  # Accepted (Simulated Annealing)
+        mode_label = "DOOR-TO-DOOR" if all(s.walk_radius == 0 for s in self.curr_sol.students) else ("UNCONSTRAINED" if unconstrained else "SAFE")
+        print(f"  Pre-calculating {mode_label} menus for {len(self.curr_sol.students)} students...")
+        total_options = 0
+        for s in self.curr_sol.students:
+            nid, coords = snap_address_to_edge(s.coords, initial_sol.graph)
+            menu = [(nid, coords)]
+            if s.walk_radius > 0:
+                if unconstrained:
+                    walk_g = _get_walk_graph(initial_sol.graph)
+                    lengths = nx.single_source_dijkstra_path_length(walk_g, nid, cutoff=s.walk_radius, weight='length')
+                    for snid in sorted(lengths, key=lengths.get)[1:max_candidates_per_student]:
+                        node = initial_sol.graph.nodes[snid]
+                        menu.append((snid, (node['y'], node['x'])))
+                else:
+                    safe = find_safe_nodes_within_radius(s.coords, initial_sol.graph, 500, s.walk_radius, {"max_candidates_per_student": max_candidates_per_student})
+                    for snid, _ in safe:
+                        if snid != nid:
+                            node = initial_sol.graph.nodes[snid]
+                            menu.append((snid, (node['y'], node['x'])))
+            _student_candidate_cache[s.id] = menu[:max_candidates_per_student]
+            total_options += len(_student_candidate_cache[s.id])
+        print(f"  Pre-calculation complete. Avg options/student: {total_options/len(self.curr_sol.students):.1f}")
 
-        # Iteration diagnostics — populated during run()
-        self.iteration_log = []
-        
     def run(self):
-        t = self.temp
-        start_time = time.time()
-        block_start_time = start_time
-
-        if self.time_budget_seconds:
-            print(f"Starting ALNS Optimization (time budget: {self.time_budget_seconds}s, "
-                  f"max {self.iterations} iterations)...")
-        else:
-            print(f"Starting ALNS Optimization with {self.iterations} iterations...")
-        print(f"Initial State: {self.curr_sol}")
-
+        start = time.time()
+        print(f"  Optimization starting ({self.iterations} iters)...")
         for i in range(self.iterations):
-            # ── Time-budget early exit ──
-            if self.time_budget_seconds and (time.time() - start_time) >= self.time_budget_seconds:
-                print(f"  Time budget of {self.time_budget_seconds}s reached at iteration {i+1} — stopping.")
-                break
-            # Selection
-            d_idx = self._select_op(self.d_weights)
-            r_idx = self._select_op(self.r_weights)
+            if self.time_budget_seconds and (time.time() - start) >= self.time_budget_seconds: break
             
             new_sol = self.curr_sol.clone()
+            # 1. Destroy: remove 15-25% of students
+            n_rem = max(1, int(len(new_sol.students) * random.uniform(0.15, 0.25)))
+            random.choice(self.destroy_ops)(new_sol, n_rem)
             
-            # Destroy: Remove between 5% and 25% of students
-            n_remove = max(1, int(len(new_sol.students) * random.uniform(0.05, 0.25)))
-            self.destroy_ops[d_idx](new_sol, n_remove)
+            # 2. Repair
+            regret_repair(new_sol, unconstrained=self.unconstrained)
             
-            # Repair
-            self.repair_ops[r_idx](new_sol)
-            
-            # Score calculation
+            # 3. Objective check
             new_obj = new_sol.calculate_objective()
-            curr_obj = self.curr_sol.calculate_objective()
             best_obj = self.best_sol.calculate_objective()
             
-            reward = 0
             if new_obj > best_obj:
                 self.best_sol = new_sol.clone()
                 self.curr_sol = new_sol
-                reward = self.s1
-            elif new_obj > curr_obj:
+            elif random.random() < 0.1: # Acceptance criteria (SA)
                 self.curr_sol = new_sol
-                reward = self.s2
-            else:
-                # Simulated Annealing acceptance criteria
-                # We use (new - old) because we are MAXIMIZING
-                diff = new_obj - curr_obj # will be negative
-                p = math.exp(diff / t) if t > 0 else 0
-                if random.random() < p:
-                    self.curr_sol = new_sol
-                    reward = self.s3
-            
-            # Update weights (Adaptive)
-            alpha = 0.7
-            self.d_weights[d_idx] = alpha * self.d_weights[d_idx] + (1-alpha) * reward
-            self.r_weights[r_idx] = alpha * self.r_weights[r_idx] + (1-alpha) * reward
-            
-            t *= self.cooling
             
             if (i+1) % 10 == 0:
-                block_end_time = time.time()
-                block_elapsed = block_end_time - block_start_time
-                print(f"Iteration {i+1}: Best Obj = {best_obj:.2f}, Temp = {t:.1f}, Last 10 iter: {block_elapsed:.2f}s")
-                self.iteration_log.append({
-                    "iteration":             i + 1,
-                    "best_objective":        round(best_obj, 2),
-                    "students_served":       sum(1 for s in self.best_sol.students if s.is_served),
-                    "block_elapsed_seconds": round(block_elapsed, 3)
-                })
-                block_start_time = block_end_time
-
-        total_elapsed = time.time() - start_time
-        print(f"Optimization Complete.")
-        print(f"Total Time: {total_elapsed:.2f}s")
-        print(f"Final State: {self.best_sol}")
-
-        # ── Final repair pass: rescue any remaining unserved students ──
-        unserved_count = sum(1 for s in self.best_sol.students if not s.is_served)
-        if unserved_count > 0:
-            print(f"Running final repair pass on {unserved_count} unserved students...")
-            greedy_repair(self.best_sol)
-            rescued = unserved_count - sum(1 for s in self.best_sol.students if not s.is_served)
-            if rescued > 0:
-                print(f"  Repair pass rescued {rescued} student(s).")
-            else:
-                print(f"  Repair pass: no additional students could be inserted.")
+                print(f"    Iteration {i+1}: Best Obj = {self.best_sol.calculate_objective():.0f}")
 
         return self.best_sol
-
-    def _select_op(self, weights):
-        probs = weights / np.sum(weights)
-        return np.random.choice(len(weights), p=probs)
