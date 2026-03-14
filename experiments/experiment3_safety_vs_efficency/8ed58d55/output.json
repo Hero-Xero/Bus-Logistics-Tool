@@ -1,32 +1,32 @@
 {
-  "generated_at": "28/02/26 08:05 am",
-  "total_wall_time_seconds": 898.41,
+  "generated_at": "14/03/26 08:03 am",
+  "total_wall_time_seconds": 836.58,
   "debug_stats": {
     "step_times": {
-      "generate_dataset_s": 20.31,
-      "build_constrained_graph_s": 22.79,
-      "build_unconstrained_graph_s": 23.78,
-      "build_map_s": 45.98
+      "generate_dataset_s": 19.33,
+      "build_constrained_graph_s": 20.91,
+      "build_unconstrained_graph_s": 22.67,
+      "build_map_s": 44.02
     },
     "mode_breakdown": {
       "A": {
-        "mode_wall_time_s": 719.34,
-        "alns_solve_s": 233.99,
-        "setup_and_overhead_s": 485.35,
+        "mode_wall_time_s": 666.78,
+        "alns_solve_s": 220.66,
+        "setup_and_overhead_s": 446.12,
         "alns_iterations": null,
         "n_candidates_per_student": 1.0
       },
       "B": {
-        "mode_wall_time_s": 58.27,
-        "alns_solve_s": 13.79,
-        "setup_and_overhead_s": 44.48,
+        "mode_wall_time_s": 54.77,
+        "alns_solve_s": 13.03,
+        "setup_and_overhead_s": 41.74,
         "alns_iterations": null,
         "n_candidates_per_student": 1.0
       },
       "C": {
-        "mode_wall_time_s": 7.94,
-        "alns_solve_s": 2.87,
-        "setup_and_overhead_s": 5.07,
+        "mode_wall_time_s": 8.09,
+        "alns_solve_s": 3.19,
+        "setup_and_overhead_s": 4.9,
         "alns_iterations": null,
         "n_candidates_per_student": 1.0
       }
@@ -36,7 +36,12 @@
     "n_students": 60,
     "seed": 42,
     "iterations": 60,
+    "buses_count": 4,
     "buses_capacity": 22,
+    "minimize_buses": true,
+    "constraints_enabled": true,
+    "time_budget_seconds": 60,
+    "max_candidates_per_student": 4,
     "stage_walk_limits": {
       "KG": 0,
       "ELEMENTARY": 0,
@@ -48,6 +53,18 @@
       "ELEMENTARY": 0.0,
       "MIDDLE": 0.5,
       "HIGH": 0.5
+    },
+    "constraints": {
+      "enabled": true,
+      "ride_time_multiplier": 3,
+      "floor_minutes": 30,
+      "ceiling_minutes": 60,
+      "bidirectional_check": true
+    },
+    "algorithm": {
+      "time_budget_seconds": 60,
+      "max_candidates_per_student": 4,
+      "minimize_buses": true
     }
   },
   "modes": {
@@ -58,7 +75,7 @@
       "total_route_time_min": 128.03,
       "total_route_dist_km": 76.06,
       "avg_route_time_min": 32.01,
-      "alns_runtime_seconds": 233.99,
+      "alns_runtime_seconds": 220.66,
       "mode_wall_time_seconds": null,
       "unsafe_crossings": 3,
       "walk_stats": {
@@ -484,6 +501,9 @@
           "walk_distance_m": 152.4
         }
       ],
+      "buses_available": 4,
+      "bus_capacity": 22,
+      "buses_used": 4,
       "fleet_search": {
         "buses_used": 4,
         "summary": "No fleet size in range 3..4 served all students. Best: k=4 with 59/60 served, 1 unserved. 1 student(s) likely unserved due to ALNS budget exhaustion — try increasing time_budget_seconds.",
@@ -493,7 +513,7 @@
             "served": 53,
             "unserved": 7,
             "feasible": false,
-            "runtime_s": 479.21,
+            "runtime_s": 440.63,
             "rejection_reasons": {
               "search_budget_exhausted": 7
             }
@@ -503,7 +523,7 @@
             "served": 59,
             "unserved": 1,
             "feasible": false,
-            "runtime_s": 233.99,
+            "runtime_s": 220.66,
             "rejection_reasons": {
               "search_budget_exhausted": 1
             }
@@ -518,7 +538,7 @@
       "total_route_time_min": 127.43,
       "total_route_dist_km": 73.24,
       "avg_route_time_min": 31.86,
-      "alns_runtime_seconds": 13.79,
+      "alns_runtime_seconds": 13.03,
       "mode_wall_time_seconds": null,
       "unsafe_crossings": 7,
       "walk_stats": {
@@ -951,6 +971,9 @@
           "walk_distance_m": 150.0
         }
       ],
+      "buses_available": 4,
+      "bus_capacity": 22,
+      "buses_used": 4,
       "fleet_search": {
         "buses_used": 4,
         "summary": "k=4 is the minimum feasible fleet size",
@@ -960,7 +983,7 @@
             "served": 55,
             "unserved": 5,
             "feasible": false,
-            "runtime_s": 34.54,
+            "runtime_s": 32.3,
             "rejection_reasons": {
               "search_budget_exhausted": 5
             }
@@ -970,7 +993,7 @@
             "served": 60,
             "unserved": 0,
             "feasible": true,
-            "runtime_s": 13.79,
+            "runtime_s": 13.03,
             "rejection_reasons": {}
           }
         ]
@@ -983,7 +1006,7 @@
       "total_route_time_min": 135.95,
       "total_route_dist_km": 66.4,
       "avg_route_time_min": 33.99,
-      "alns_runtime_seconds": 2.87,
+      "alns_runtime_seconds": 3.19,
       "mode_wall_time_seconds": null,
       "unsafe_crossings": 0,
       "walk_stats": {
@@ -1388,6 +1411,9 @@
           "walk_distance_m": 0.0
         }
       ],
+      "buses_available": 4,
+      "bus_capacity": 22,
+      "buses_used": 4,
       "fleet_search": {
         "buses_used": 4,
         "summary": "No fleet size in range 3..4 served all students. Best: k=4 with 56/60 served, 4 unserved. 4 student(s) have walk_radius=0 with no candidate stop found.",
@@ -1397,7 +1423,7 @@
             "served": 47,
             "unserved": 13,
             "feasible": false,
-            "runtime_s": 4.95,
+            "runtime_s": 4.81,
             "rejection_reasons": {
               "zero_walk_radius_no_candidates": 13
             }
@@ -1407,7 +1433,7 @@
             "served": 56,
             "unserved": 4,
             "feasible": false,
-            "runtime_s": 2.87,
+            "runtime_s": 3.19,
             "rejection_reasons": {
               "zero_walk_radius_no_candidates": 4
             }

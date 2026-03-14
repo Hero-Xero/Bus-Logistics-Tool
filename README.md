@@ -9,24 +9,25 @@ wget http://download.geofabrik.de/africa/egypt-latest.osm.pbf
 
 ### Extract the map (builds the road network):
 
+# 2. Extract cleanly
 ```bash
-docker run -t -v "${PWD}:/data" osrm/osrm-backend \
-    osrm-extract -p /opt/car.lua /data/egypt-latest.osm.pbf
+docker run -t -v "${PWD}:/data" osrm/osrm-backend osrm-extract -p /opt/car.lua /data/egypt-latest.osm.pbf
+```
+# 3. Contract cleanly
+```bash
+docker run -t -v "${PWD}:/data" osrm/osrm-backend osrm-contract /data/egypt-latest.osrm
+```
+# 4. Start the server again
+```bash
+docker run -d -p 5000:5000 -v "${PWD}:/data" osrm/osrm-backend osrm-routed --max-table-size 8000 /data/egypt-latest.osrm
 ```
 
-### Contract the graph (optimizes routing performance):
-
-```bash
-docker run -t -v "${PWD}:/data" osrm/osrm-backend \
-    osrm-contract /data/egypt-latest.osrm
-```
-
-### Start the OSRM server:
-
-```bash
-docker run -d -p 5000:5000 -v "${PWD}:/data" osrm/osrm-backend \
-    osrm-routed /data/egypt-latest.osrm
-```
 
 Done. The routing engine is now available at `http://localhost:5000`.
-```
+
+
+### Results
+
+check `780ff238` folder in expirement 3 for inout_caps_off_high.json
+
+check `055b75b5` folder in expirement 3 for input_caps_off.json

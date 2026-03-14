@@ -981,11 +981,21 @@ def _build_custom_layer_control_js(
 
 
 def _build_stats_html(all_stats, crossings_dict, occupancies_dict,
-                      solutions_dict=None, G=None, constraints=None):
+                      solutions_dict=None, G=None, constraints=None,
+                      meta=None):
     now    = datetime.datetime.now()
     hour12 = now.hour % 12 or 12
     ampm   = "am" if now.hour < 12 else "pm"
     ts     = now.strftime("%d/%m/%y") + f" {hour12:02d}:{now.strftime('%M')} {ampm}"
+
+    algo = (meta or {}).get("algorithm", {}) if meta else {}
+    buses_cfg = (meta or {}).get("buses", {}) if meta else {}
+    caps_on = (constraints or {}).get("enabled", True)
+    time_budget = algo.get("time_budget_seconds", None)
+    max_cands = algo.get("max_candidates_per_student", None)
+    buses_count = buses_cfg.get("count", None)
+    bus_capacity = buses_cfg.get("capacity", None)
+    minimize_buses = bool(algo.get("minimize_buses", False))
 
     blocks = ""
     _build_stats_html._mode_tables = ""   # accumulator for side-by-side mode tables
@@ -1022,6 +1032,22 @@ def _build_stats_html(all_stats, crossings_dict, occupancies_dict,
 
         sat_by_route = s.get("sat_by_route", {})
 
+        fleet_summary = s.get("fleet_search_summary")
+        buses_used = s.get("buses_used")
+        fleet_line = ""
+        if buses_used is not None and buses_count is not None:
+            cap_str = f" (cap {bus_capacity})" if bus_capacity is not None else ""
+            fleet_line = f"<div style=\"font-size:11px; color:#666;\">Fleet: used {buses_used}/{buses_count} buses{cap_str}</div>"
+        elif buses_count is not None:
+            cap_str = f" (cap {bus_capacity})" if bus_capacity is not None else ""
+            fleet_line = f"<div style=\"font-size:11px; color:#666;\">Fleet: {buses_count} buses{cap_str}</div>"
+        fleet_note = f"<div style=\"font-size:11px; color:#777; margin-top:2px;\">{fleet_summary}</div>" if fleet_summary else ""
+        fleet_cell = "-"
+        if buses_used is not None and buses_count is not None:
+            fleet_cell = f"{buses_used}/{buses_count}"
+        elif buses_count is not None:
+            fleet_cell = f"{buses_count}"
+
         blocks += f"""
         <div style="margin-bottom:8px; padding-bottom:8px;
                     border-bottom:1px solid #e0e0e0;">
@@ -1032,6 +1058,7 @@ def _build_stats_html(all_stats, crossings_dict, occupancies_dict,
                         font-size:11px; text-align:center;">
             <tr style="color:#555;">
               <td style="text-align:left; padding:1px 4px;">Routes</td>
+              <td style="text-align:left; padding:1px 4px;">Fleet</td>
               <td style="text-align:left; padding:1px 4px;">Total Time</td>
               <td style="text-align:left; padding:1px 4px;">Distance</td>
               <td style="text-align:left; padding:1px 4px;">Avg Occ.</td>
@@ -1041,6 +1068,7 @@ def _build_stats_html(all_stats, crossings_dict, occupancies_dict,
             </tr>
             <tr style="font-weight:bold;">
               <td style="padding:1px 4px;">{s['routes']}</td>
+              <td style="padding:1px 4px;">{fleet_cell}</td>
               <td style="padding:1px 4px;">{s['total_time']:.0f} min</td>
               <td style="padding:1px 4px;">{s['total_dist']:.1f} km</td>
               <td style="padding:1px 4px;">{avg_occ_str}</td>
@@ -1049,6 +1077,8 @@ def _build_stats_html(all_stats, crossings_dict, occupancies_dict,
               <td style="padding:1px 4px; color:{cx_color};">{cx}</td>
             </tr>
           </table>
+          {fleet_line}
+          {fleet_note}
         </div>"""
 
         # Per-mode mini-table for the side-by-side horizontal layout
@@ -1104,16 +1134,31 @@ def _build_stats_html(all_stats, crossings_dict, occupancies_dict,
         </div>
       </div>"""
 
+    algo_lines = []
+    algo_lines.append(f"Caps: {'ON' if caps_on else 'OFF'}")
+    algo_lines.append(f"MinFleet: {'ON' if minimize_buses else 'OFF'}")
+    if time_budget is not None:
+        algo_lines.append(f"Budget: {time_budget}s")
+    if max_cands is not None:
+        algo_lines.append(f"Candidates: {max_cands}")
+    if buses_count is not None:
+        cap_str = f" (cap {bus_capacity})" if bus_capacity is not None else ""
+        algo_lines.append(f"Fleet: {buses_count}{cap_str}")
+    algo_line = " | ".join(algo_lines)
+
     return f"""
     <div style="position:fixed; bottom:15px; right:15px; width:430px;
                 max-height:260px; overflow-y:auto;
                 background:white; border:2px solid #555; z-index:9999;
                 padding:12px 14px; border-radius:6px; font-size:12px;
                 font-family:Arial,sans-serif; box-shadow:2px 2px 8px rgba(0,0,0,.25);">
-      <div style="font-weight:bold; font-size:13px; margin-bottom:10px;
+            <div style="font-weight:bold; font-size:13px; margin-bottom:10px;
                   padding-bottom:6px; border-bottom:2px solid #ccc;">
         Three-Mode Routing Comparison
       </div>
+            <div style="font-size:11px; color:#666; margin-bottom:8px;">
+                {algo_line}
+            </div>
       {blocks}
       {route_table}
       <div style="font-size:10px; color:#888; margin-top:6px;">
@@ -1247,6 +1292,13 @@ def _build_metrics(meta, stage_walk, all_stats, crossings_dict,
                         "walk_distance_m": round(walk_dist, 1),
                     })
         
+        buses_cfg = meta.get("buses", {})
+        buses_available = buses_cfg.get("count")
+        bus_capacity = buses_cfg.get("capacity")
+        buses_used = s.get("buses_used")
+        if buses_used is None and buses_available is not None:
+            buses_used = buses_available
+
         mode_entry = {
             "routes_created":       n_routes,
             "students_served":      s["served"],
@@ -1259,6 +1311,9 @@ def _build_metrics(meta, stage_walk, all_stats, crossings_dict,
             "unsafe_crossings":     cx,
             "walk_stats":           walk,
             "students":             students_list,
+            "buses_available":       buses_available,
+            "bus_capacity":          bus_capacity,
+            "buses_used":            buses_used,
         }
         # Attach fleet-search diagnostics if present
         if s.get("fleet_search_log"):
@@ -1313,11 +1368,28 @@ def _build_metrics(meta, stage_walk, all_stats, crossings_dict,
             "n_students":       meta.get("n_students"),
             "seed":             meta.get("seed"),
             "iterations":       iters,
+            "buses_count":      meta.get("buses", {}).get("count"),
             "buses_capacity":   meta.get("buses", {}).get("capacity"),
+            "minimize_buses":   meta.get("algorithm", {}).get("minimize_buses", False),
+            "constraints_enabled": meta.get("constraints", {}).get("enabled", True),
+            "time_budget_seconds": meta.get("algorithm", {}).get("time_budget_seconds"),
+            "max_candidates_per_student": meta.get("algorithm", {}).get("max_candidates_per_student"),
             "stage_walk_limits": stage_walk,
             "stage_distribution": {
                 k: v for k, v in meta.get("stage_distribution", {}).items()
                 if k != "_comment"
+            },
+            "constraints": {
+                "enabled": meta.get("constraints", {}).get("enabled", True),
+                "ride_time_multiplier": meta.get("constraints", {}).get("ride_time_multiplier"),
+                "floor_minutes": meta.get("constraints", {}).get("floor_minutes"),
+                "ceiling_minutes": meta.get("constraints", {}).get("ceiling_minutes"),
+                "bidirectional_check": meta.get("constraints", {}).get("bidirectional_check"),
+            },
+            "algorithm": {
+                "time_budget_seconds": meta.get("algorithm", {}).get("time_budget_seconds"),
+                "max_candidates_per_student": meta.get("algorithm", {}).get("max_candidates_per_student"),
+                "minimize_buses": meta.get("algorithm", {}).get("minimize_buses", False),
             },
         },
         "modes": modes_out,
@@ -1461,6 +1533,8 @@ def run(input_path=None, output_path=None, iterations=None):
         sol_a, stats_a, school_a = run_algorithm(
             data_a, G_con, iterations=iters, stage_walk_limits=stage_walk, G_drive=G_unc)
     stats_a["label"] = "Mode-A"
+    if "buses_used" not in stats_a:
+        stats_a["buses_used"] = meta.get("buses", {}).get("count")
     # Snapshot candidate data before caches are cleared for next mode
     cands_a    = {sid: list(v) for sid, v in _alns._student_candidate_cache.items()}
     cand_dist_a = {sid: dict(v) for sid, v in _alns._student_candidate_dist.items()}
@@ -1489,6 +1563,8 @@ def run(input_path=None, output_path=None, iterations=None):
     else:
         sol_b, stats_b, school_b = run_algorithm(data_b, G_unc, iterations=iters, G_drive=G_unc)
     stats_b["label"] = "Mode-B"
+    if "buses_used" not in stats_b:
+        stats_b["buses_used"] = meta.get("buses", {}).get("count")
     cands_b    = {sid: list(v) for sid, v in _alns._student_candidate_cache.items()}
     cand_dist_b = {sid: dict(v) for sid, v in _alns._student_candidate_dist.items()}
     _mode_wall_times["B"] = round(_wtime.time() - _t_b, 2)
@@ -1515,6 +1591,8 @@ def run(input_path=None, output_path=None, iterations=None):
     else:
         sol_c, stats_c, school_c = run_algorithm(data_c, G_unc, iterations=iters, G_drive=G_unc)
     stats_c["label"] = "Mode-C"
+    if "buses_used" not in stats_c:
+        stats_c["buses_used"] = meta.get("buses", {}).get("count")
     cands_c    = {sid: list(v) for sid, v in _alns._student_candidate_cache.items()}
     cand_dist_c = {sid: dict(v) for sid, v in _alns._student_candidate_dist.items()}
     _mode_wall_times["C"] = round(_wtime.time() - _t_c, 2)
@@ -1619,7 +1697,8 @@ def run(input_path=None, output_path=None, iterations=None):
         _build_stats_html(all_stats, crossings_dict, occupancies_dict,
                           solutions_dict={"A": sol_a, "B": sol_b, "C": sol_c},
                           G=G_unc,
-                          constraints=meta.get("constraints", {}))))
+                          constraints=meta.get("constraints", {}),
+                          meta=meta)))
 
     m.save(output)
     fsize_kb = os.path.getsize(output) / 1024
