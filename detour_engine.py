@@ -1358,6 +1358,16 @@ def validate_permanent_student(new_stop, route, insert_position, delta_time_minu
     floor_min    = getattr(route, 'floor_minutes',        45)
     ceiling_min  = getattr(route, 'ceiling_minutes',      60)  # extra minutes over direct
 
+    caps_enabled = getattr(route, 'ride_caps_enabled', True)
+    soft_caps    = getattr(route, 'soft_ride_caps', False)
+
+    if soft_caps or not caps_enabled:
+        # Skip all ride-time checks; caps are soft or disabled.
+        new_student_ride_time = calculate_student_ride_time_potential(
+            route, new_stop, insert_position, graph
+        )
+        return True, new_student_ride_time, "Ride-time caps not enforced"
+
     # Fast-exit for unconstrained / benchmark mode: skip all ride-time checks.
     # When multiplier >= 100 and floor >= 999, no real cap exists; avoid O(N^2) work.
     if k >= 100 and floor_min >= 999:

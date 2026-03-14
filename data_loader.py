@@ -111,6 +111,8 @@ def load_mode1_input(data, G):
     floor_minutes        = constraints.get('floor_minutes',        45)
     ceiling_minutes      = constraints.get('ceiling_minutes',      60)
     bidirectional_check  = constraints.get('bidirectional_check',  True)
+    caps_enabled         = constraints.get('enabled',              True)
+    soft_ride_caps       = constraints.get('soft_ride_caps',       False)
     # Legacy flat cap — kept as fallback (= ceiling)
     route_tmax = constraints.get('route_tmax', ceiling_minutes)
     
@@ -133,6 +135,9 @@ def load_mode1_input(data, G):
             ceiling_minutes=ceiling_minutes,
             bidirectional_check=bidirectional_check,
         )
+        # Flags used by validate_permanent_student for hard/soft cap behavior
+        route.ride_caps_enabled = caps_enabled
+        route.soft_ride_caps    = soft_ride_caps
         
         node_lat = school_node_lat
         node_lon = school_node_lon

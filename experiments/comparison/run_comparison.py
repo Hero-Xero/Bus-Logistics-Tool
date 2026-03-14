@@ -710,6 +710,103 @@ def _count_satisfied_per_route(sol, G, constraints):
 def _count_satisfied(sol, G, constraints):
     """Total satisfied count (sum of _count_satisfied_per_route)."""
     return sum(_count_satisfied_per_route(sol, G, constraints).values())
+    
+def _count_cap_violations(sol, G, constraints):
+    """Count AM/PM ride-time cap violations among served students.
+
+    Returns a dict with AM/PM counts or None values when caps are off.
+    """
+    if not constraints:
+        return {
+            "am": None, "am_checked": None, "am_pct": None,
+            "pm": None, "pm_checked": None, "pm_pct": None,
+        }
+    enabled = bool(constraints.get("enabled", True))
+    soft = bool(constraints.get("soft_ride_caps", False))
+    if not enabled and not soft:
+        return {
+            "am": None, "am_checked": None, "am_pct": None,
+            "pm": None, "pm_checked": None, "pm_pct": None,
+        }
+
+    k_mult = float(constraints.get("ride_time_multiplier", 2.5))
+    floor_min = float(constraints.get("floor_minutes", 45))
+    ceiling_min = float(constraints.get("ceiling_minutes", 60))
+
+    def _edge_time(u, v):
+        t = _MATRIX_CACHE.get((u, v), None)
+        if t is None:
+            _, t = find_shortest_path_with_turns(G, u, v)
+        return t if math.isfinite(t) else None
+
+    am_viol = am_checked = 0
+    pm_viol = pm_checked = 0
+
+    for route in sol.routes:
+        if not route.stops:
+            continue
+        school_node = route.stops[-1].node_id
+
+        # AM ride times: stop -> school (forward)
+        am_time_by_stop = {}
+        total = 0.0
+        ok = True
+        for i in range(len(route.stops) - 1, 0, -1):
+            u = route.stops[i - 1].node_id
+            v = route.stops[i].node_id
+            t = _edge_time(u, v)
+            if t is None:
+                ok = False
+                break
+            total += t
+            am_time_by_stop[route.stops[i - 1]] = total
+        if not ok:
+            am_time_by_stop = {}
+
+        # PM ride times: school -> stop in reversed route
+        pm_time_by_stop = {}
+        interior = route.stops[1:-1][::-1]
+        pm_stops = [route.stops[0]] + interior + [route.stops[-1]]
+        total = 0.0
+        ok = True
+        for i in range(len(pm_stops) - 1):
+            u = pm_stops[i].node_id
+            v = pm_stops[i + 1].node_id
+            t = _edge_time(u, v)
+            if t is None:
+                ok = False
+                break
+            total += t
+            pm_time_by_stop[pm_stops[i + 1]] = total
+        if not ok:
+            pm_time_by_stop = {}
+
+        for stop in route.stops:
+            if stop.stop_type == "school":
+                continue
+            ride_am = am_time_by_stop.get(stop)
+            ride_pm = pm_time_by_stop.get(stop)
+            for student in stop.students:
+                direct_time = compute_direct_time(student, school_node, G)
+                if direct_time is None or not math.isfinite(direct_time) or direct_time <= 0:
+                    continue
+                cap = max(floor_min, min(k_mult * direct_time, direct_time + ceiling_min))
+
+                if ride_am is not None:
+                    am_checked += 1
+                    if ride_am > cap:
+                        am_viol += 1
+                if ride_pm is not None:
+                    pm_checked += 1
+                    if ride_pm > cap:
+                        pm_viol += 1
+
+    am_pct = round(am_viol / am_checked * 100, 1) if am_checked else None
+    pm_pct = round(pm_viol / pm_checked * 100, 1) if pm_checked else None
+    return {
+        "am": am_viol, "am_checked": am_checked, "am_pct": am_pct,
+        "pm": pm_viol, "pm_checked": pm_checked, "pm_pct": pm_pct,
+    }
 
 
 def _add_candidate_layer(m, G, mode_key, sol, cand_cache, cand_dist):
@@ -991,6 +1088,7 @@ def _build_stats_html(all_stats, crossings_dict, occupancies_dict,
     algo = (meta or {}).get("algorithm", {}) if meta else {}
     buses_cfg = (meta or {}).get("buses", {}) if meta else {}
     caps_on = (constraints or {}).get("enabled", True)
+    soft_caps = (constraints or {}).get("soft_ride_caps", False)
     time_budget = algo.get("time_budget_seconds", None)
     max_cands = algo.get("max_candidates_per_student", None)
     buses_count = buses_cfg.get("count", None)
@@ -1047,6 +1145,24 @@ def _build_stats_html(all_stats, crossings_dict, occupancies_dict,
             fleet_cell = f"{buses_used}/{buses_count}"
         elif buses_count is not None:
             fleet_cell = f"{buses_count}"
+        
+        cap_viol = s.get("cap_violations_am")
+        cap_checked = s.get("cap_checked_am")
+        cap_pct = s.get("cap_violation_pct_am")
+        cap_pm_viol = s.get("cap_violations_pm")
+        cap_pm_checked = s.get("cap_checked_pm")
+        cap_pm_pct = s.get("cap_violation_pct_pm")
+        cap_line = ""
+        if cap_viol is not None or cap_pm_viol is not None:
+            am_pct_str = f" ({cap_pct}%)" if cap_pct is not None else ""
+            pm_pct_str = f" ({cap_pm_pct}%)" if cap_pm_pct is not None else ""
+            am_str = f"AM {cap_viol}/{cap_checked}{am_pct_str}" if cap_viol is not None else "AM —"
+            pm_str = f"PM {cap_pm_viol}/{cap_pm_checked}{pm_pct_str}" if cap_pm_viol is not None else "PM —"
+            cap_line = (
+                f"<div style=\"font-size:11px; color:#777; margin-top:2px;\">"
+                f"Cap violations: {am_str} | {pm_str}"
+                f"</div>"
+            )
 
         blocks += f"""
         <div style="margin-bottom:8px; padding-bottom:8px;
@@ -1079,6 +1195,7 @@ def _build_stats_html(all_stats, crossings_dict, occupancies_dict,
           </table>
           {fleet_line}
           {fleet_note}
+          {cap_line}
         </div>"""
 
         # Per-mode mini-table for the side-by-side horizontal layout
@@ -1136,7 +1253,11 @@ def _build_stats_html(all_stats, crossings_dict, occupancies_dict,
 
     algo_lines = []
     algo_lines.append(f"Caps: {'ON' if caps_on else 'OFF'}")
+    algo_lines.append(f"SoftCaps: {'ON' if soft_caps else 'OFF'}")
     algo_lines.append(f"MinFleet: {'ON' if minimize_buses else 'OFF'}")
+    cap_penalty = (constraints or {}).get("cap_penalty_per_minute", None)
+    if cap_penalty is not None:
+        algo_lines.append(f"CapPenalty: {cap_penalty}/min")
     if time_budget is not None:
         algo_lines.append(f"Budget: {time_budget}s")
     if max_cands is not None:
@@ -1314,6 +1435,12 @@ def _build_metrics(meta, stage_walk, all_stats, crossings_dict,
             "buses_available":       buses_available,
             "bus_capacity":          bus_capacity,
             "buses_used":            buses_used,
+            "ride_cap_violations_am": s.get("cap_violations_am"),
+            "ride_cap_checked_am":    s.get("cap_checked_am"),
+            "ride_cap_violation_pct_am": s.get("cap_violation_pct_am"),
+            "ride_cap_violations_pm": s.get("cap_violations_pm"),
+            "ride_cap_checked_pm":    s.get("cap_checked_pm"),
+            "ride_cap_violation_pct_pm": s.get("cap_violation_pct_pm"),
         }
         # Attach fleet-search diagnostics if present
         if s.get("fleet_search_log"):
@@ -1371,7 +1498,9 @@ def _build_metrics(meta, stage_walk, all_stats, crossings_dict,
             "buses_count":      meta.get("buses", {}).get("count"),
             "buses_capacity":   meta.get("buses", {}).get("capacity"),
             "minimize_buses":   meta.get("algorithm", {}).get("minimize_buses", False),
+            "force_fleet_size": meta.get("algorithm", {}).get("force_fleet_size"),
             "constraints_enabled": meta.get("constraints", {}).get("enabled", True),
+            "soft_ride_caps": meta.get("constraints", {}).get("soft_ride_caps", False),
             "time_budget_seconds": meta.get("algorithm", {}).get("time_budget_seconds"),
             "max_candidates_per_student": meta.get("algorithm", {}).get("max_candidates_per_student"),
             "stage_walk_limits": stage_walk,
@@ -1381,6 +1510,8 @@ def _build_metrics(meta, stage_walk, all_stats, crossings_dict,
             },
             "constraints": {
                 "enabled": meta.get("constraints", {}).get("enabled", True),
+                "soft_ride_caps": meta.get("constraints", {}).get("soft_ride_caps", False),
+                "cap_penalty_per_minute": meta.get("constraints", {}).get("cap_penalty_per_minute"),
                 "ride_time_multiplier": meta.get("constraints", {}).get("ride_time_multiplier"),
                 "floor_minutes": meta.get("constraints", {}).get("floor_minutes"),
                 "ceiling_minutes": meta.get("constraints", {}).get("ceiling_minutes"),
@@ -1390,6 +1521,7 @@ def _build_metrics(meta, stage_walk, all_stats, crossings_dict,
                 "time_budget_seconds": meta.get("algorithm", {}).get("time_budget_seconds"),
                 "max_candidates_per_student": meta.get("algorithm", {}).get("max_candidates_per_student"),
                 "minimize_buses": meta.get("algorithm", {}).get("minimize_buses", False),
+                "force_fleet_size": meta.get("algorithm", {}).get("force_fleet_size"),
             },
         },
         "modes": modes_out,
@@ -1441,7 +1573,10 @@ def run(input_path=None, output_path=None, iterations=None):
 
     meta           = _load_meta(input_path)
     iters          = iterations or meta.get("algorithm", {}).get("iterations", 30)
-    minimize_buses = meta.get("algorithm", {}).get("minimize_buses", False)
+    algo_cfg       = meta.get("algorithm", {})
+    iters          = iterations or algo_cfg.get("iterations", 30)
+    minimize_buses = algo_cfg.get("minimize_buses", False)
+    force_k        = algo_cfg.get("force_fleet_size")
 
     # ── Debug / partial-run flags ──
     _dbg       = meta.get("debug", {})
@@ -1525,7 +1660,14 @@ def run(input_path=None, output_path=None, iterations=None):
         _relax_ride_constraints(data_a)
     _reset_caches()
     _prebuild_ball_tree(G_con)
-    if minimize_buses:
+    if force_k:
+        data_a["data"]["buses"] = data_a["data"]["buses"][:int(force_k)]
+        print(f"  [FleetSearch] force_fleet_size={force_k} — using fixed fleet for Mode A")
+        minimize_a = False
+    else:
+        minimize_a = minimize_buses
+
+    if minimize_a:
         print("  [FleetSearch] minimize_buses=True — searching minimum fleet for Mode A")
         _, sol_a, stats_a, school_a = find_minimum_fleet(
             data_a, G_con, iterations=iters, stage_walk_limits=stage_walk, G_drive=G_unc)
@@ -1533,6 +1675,16 @@ def run(input_path=None, output_path=None, iterations=None):
         sol_a, stats_a, school_a = run_algorithm(
             data_a, G_con, iterations=iters, stage_walk_limits=stage_walk, G_drive=G_unc)
     stats_a["label"] = "Mode-A"
+    if "cap_violations_am" not in stats_a:
+        cv = _count_cap_violations(sol_a, G_unc, meta.get("constraints", {}))
+        stats_a["cap_violations_am"] = cv["am"]
+        stats_a["cap_checked_am"] = cv["am_checked"]
+        stats_a["cap_violation_pct_am"] = cv["am_pct"]
+        stats_a["cap_violations_pm"] = cv["pm"]
+        stats_a["cap_checked_pm"] = cv["pm_checked"]
+        stats_a["cap_violation_pct_pm"] = cv["pm_pct"]
+    if force_k:
+        stats_a["buses_used"] = int(force_k)
     if "buses_used" not in stats_a:
         stats_a["buses_used"] = meta.get("buses", {}).get("count")
     # Snapshot candidate data before caches are cleared for next mode
@@ -1556,13 +1708,30 @@ def run(input_path=None, output_path=None, iterations=None):
     _reset_caches(keep_matrix=True)
     import gc as _gc; _gc.collect()   # reclaim freed walk-graph + candidate memory
     _prebuild_ball_tree(G_unc)
-    if minimize_buses:
+    if force_k:
+        data_b["data"]["buses"] = data_b["data"]["buses"][:int(force_k)]
+        print(f"  [FleetSearch] force_fleet_size={force_k} — using fixed fleet for Mode B")
+        minimize_b = False
+    else:
+        minimize_b = minimize_buses
+
+    if minimize_b:
         print("  [FleetSearch] minimize_buses=True — searching minimum fleet for Mode B")
         _, sol_b, stats_b, school_b = find_minimum_fleet(
             data_b, G_unc, iterations=iters, G_drive=G_unc)
     else:
         sol_b, stats_b, school_b = run_algorithm(data_b, G_unc, iterations=iters, G_drive=G_unc)
     stats_b["label"] = "Mode-B"
+    if "cap_violations_am" not in stats_b:
+        cv = _count_cap_violations(sol_b, G_unc, meta.get("constraints", {}))
+        stats_b["cap_violations_am"] = cv["am"]
+        stats_b["cap_checked_am"] = cv["am_checked"]
+        stats_b["cap_violation_pct_am"] = cv["am_pct"]
+        stats_b["cap_violations_pm"] = cv["pm"]
+        stats_b["cap_checked_pm"] = cv["pm_checked"]
+        stats_b["cap_violation_pct_pm"] = cv["pm_pct"]
+    if force_k:
+        stats_b["buses_used"] = int(force_k)
     if "buses_used" not in stats_b:
         stats_b["buses_used"] = meta.get("buses", {}).get("count")
     cands_b    = {sid: list(v) for sid, v in _alns._student_candidate_cache.items()}
@@ -1584,13 +1753,30 @@ def run(input_path=None, output_path=None, iterations=None):
     # Only ALNS candidate caches are cleared (different walk_radius=0 config).
     _reset_caches(keep_matrix=True, keep_walk=True)
     _prebuild_ball_tree(G_unc)
-    if minimize_buses:
+    if force_k:
+        data_c["data"]["buses"] = data_c["data"]["buses"][:int(force_k)]
+        print(f"  [FleetSearch] force_fleet_size={force_k} — using fixed fleet for Mode C")
+        minimize_c = False
+    else:
+        minimize_c = minimize_buses
+
+    if minimize_c:
         print("  [FleetSearch] minimize_buses=True — searching minimum fleet for Mode C")
         _, sol_c, stats_c, school_c = find_minimum_fleet(
             data_c, G_unc, iterations=iters, G_drive=G_unc)
     else:
         sol_c, stats_c, school_c = run_algorithm(data_c, G_unc, iterations=iters, G_drive=G_unc)
     stats_c["label"] = "Mode-C"
+    if "cap_violations_am" not in stats_c:
+        cv = _count_cap_violations(sol_c, G_unc, meta.get("constraints", {}))
+        stats_c["cap_violations_am"] = cv["am"]
+        stats_c["cap_checked_am"] = cv["am_checked"]
+        stats_c["cap_violation_pct_am"] = cv["am_pct"]
+        stats_c["cap_violations_pm"] = cv["pm"]
+        stats_c["cap_checked_pm"] = cv["pm_checked"]
+        stats_c["cap_violation_pct_pm"] = cv["pm_pct"]
+    if force_k:
+        stats_c["buses_used"] = int(force_k)
     if "buses_used" not in stats_c:
         stats_c["buses_used"] = meta.get("buses", {}).get("count")
     cands_c    = {sid: list(v) for sid, v in _alns._student_candidate_cache.items()}
@@ -1658,6 +1844,14 @@ def run(input_path=None, output_path=None, iterations=None):
         _sat_by_route = _count_satisfied_per_route(sol, G_unc, meta.get("constraints", {}))
         all_stats[mk]["satisfied"]     = sum(_sat_by_route.values())
         all_stats[mk]["sat_by_route"]  = _sat_by_route
+        if "cap_violations_am" not in all_stats[mk]:
+            cv = _count_cap_violations(sol, G_unc, meta.get("constraints", {}))
+            all_stats[mk]["cap_violations_am"] = cv["am"]
+            all_stats[mk]["cap_checked_am"] = cv["am_checked"]
+            all_stats[mk]["cap_violation_pct_am"] = cv["am_pct"]
+            all_stats[mk]["cap_violations_pm"] = cv["pm"]
+            all_stats[mk]["cap_checked_pm"] = cv["pm_checked"]
+            all_stats[mk]["cap_violation_pct_pm"] = cv["pm_pct"]
         fgs_unserved[mk] = _add_unserved_layer(m, sol, mk)
 
     # Candidate stop inspector layers (one per mode, hidden by default)
