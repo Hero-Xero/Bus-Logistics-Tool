@@ -160,6 +160,53 @@ def setup_graph(meta: dict = None, unconstrained: bool = False):
     print(f"Graph ready: {G.number_of_nodes()} nodes, {G.number_of_edges()} edges\n")
     return G
 
+
+def setup_walk_graph(meta: dict = None, center: tuple = None, radius_m: float = None):
+    """Build/load a walking graph (pedestrian network).
+
+    This is cached separately from the drive graph so it can be reused
+    across runs and used for walk-path visualization or walking BFS.
+    """
+    graph_cfg = (meta or {}).get('graph', {})
+    bbox = graph_cfg.get('bbox', _DEFAULT_BBOX)
+    if center is not None and radius_m is not None:
+        cache_seed = f"center={center}|radius={int(radius_m)}"
+    else:
+        cache_seed = str(bbox)
+    bbox_hash = hashlib.md5(cache_seed.encode()).hexdigest()[:8]
+    cache_dir = 'cache'
+    pkl_file = os.path.join(cache_dir, f"graph_walk_{bbox_hash}.pkl")
+    cache_file = os.path.join(cache_dir, f"graph_walk_{bbox_hash}.graphml")
+    os.makedirs(cache_dir, exist_ok=True)
+
+    if os.path.exists(pkl_file):
+        import pickle
+        print(f"Loading cached walking network (pickle): {pkl_file}")
+        with open(pkl_file, 'rb') as fh:
+            G_walk = pickle.load(fh)
+    elif os.path.exists(cache_file):
+        print(f"Loading cached walking network: {cache_file}")
+        G_walk = ox.load_graphml(cache_file)
+        import pickle
+        print("Saving walk pickle cache for faster future loads...")
+        with open(pkl_file, 'wb') as fh:
+            pickle.dump(G_walk, fh, protocol=pickle.HIGHEST_PROTOCOL)
+    else:
+        print("Downloading walking network...")
+        if center is not None and radius_m is not None:
+            # Radius-based walk graph is much smaller than full-bbox graph.
+            G_walk = ox.graph_from_point(center, dist=radius_m, network_type='walk', simplify=True)
+        else:
+            north, south, east, west = bbox[3], bbox[1], bbox[2], bbox[0]
+            G_walk = ox.graph_from_bbox((north, south, east, west), network_type='walk')
+        ox.save_graphml(G_walk, cache_file)
+        import pickle
+        with open(pkl_file, 'wb') as fh:
+            pickle.dump(G_walk, fh, protocol=pickle.HIGHEST_PROTOCOL)
+
+    print(f"Walk graph ready: {G_walk.number_of_nodes()} nodes, {G_walk.number_of_edges()} edges\n")
+    return G_walk
+
 # ============================================================================
 # MATRIX PRECOMPUTATION
 # ============================================================================

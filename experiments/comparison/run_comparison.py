@@ -35,7 +35,7 @@ import detour_engine as _eng
 import alns_engine   as _alns
 
 from run_algorithm import (
-    setup_graph, precompute_matrix, run_algorithm, find_minimum_fleet,
+    setup_graph, setup_walk_graph, precompute_matrix, run_algorithm, find_minimum_fleet,
     DEFAULT_STAGE_WALK_LIMITS,
 )
 from data_loader   import load_mode1_input
@@ -107,7 +107,6 @@ def _reset_caches(keep_matrix=False, keep_walk=False):
         _eng._DIJKSTRA_DONE.clear()
     if not keep_walk:
         _eng._WALK_DIST_CACHE.clear()
-        _eng._WALK_GRAPH = None
         _eng._safe_nodes_cache.clear()
     _eng._STUDENT_NODE_CACHE.clear()
 
@@ -306,6 +305,41 @@ def _extract_segments(G_con, center_lat, center_lon, kind="dangerous"):
     return segments
 
 
+def _extract_walk_segments(G_walk, center_lat, center_lon, radius_km=4.0, safe_only=True):
+    """Return coord lists for walk-network segments within radius_km of center.
+
+    When safe_only=True, skip major-road edges that are unsafe to cross.
+    """
+    segments = []
+    seen = set()
+    for u, v, k, data in G_walk.edges(keys=True, data=True):
+        if safe_only:
+            hw = data.get("highway", "")
+            if isinstance(hw, list):
+                hw = hw[0] if hw else ""
+            if hw in _DANGEROUS_HW_TYPES:
+                continue
+        if data.get("length", 0) < 15:
+            continue
+        ek = (min(u, v), max(u, v))
+        if ek in seen:
+            continue
+        seen.add(ek)
+        mid_lat = (G_walk.nodes[u]["y"] + G_walk.nodes[v]["y"]) / 2
+        mid_lon = (G_walk.nodes[u]["x"] + G_walk.nodes[v]["x"]) / 2
+        dlat = abs(mid_lat - center_lat) * 111.0
+        dlon = abs(mid_lon - center_lon) * 111.0 * math.cos(math.radians(center_lat))
+        if math.sqrt(dlat**2 + dlon**2) > radius_km:
+            continue
+        if "geometry" in data:
+            coords = [(lat, lon) for lon, lat in data["geometry"].coords]
+        else:
+            coords = [(G_walk.nodes[u]["y"], G_walk.nodes[u]["x"]),
+                      (G_walk.nodes[v]["y"], G_walk.nodes[v]["x"]) ]
+        segments.append(coords)
+    return segments
+
+
 # ────────────────────────────────────────────────────────────────────
 # MAP BUILDING  (with PolyLineTextPath arrows, like visualization.py)
 # ────────────────────────────────────────────────────────────────────
@@ -411,20 +445,39 @@ def _build_path_coords(G, full_path, offset=0.0):
 
 
 def _build_walk_coords(G, wp):
+    walk_g = getattr(_eng, "_WALK_GRAPH", None)
+
+    def _node_coords(nid):
+        if walk_g is not None and nid in walk_g.nodes:
+            return (walk_g.nodes[nid]["y"], walk_g.nodes[nid]["x"])
+        if nid in G.nodes:
+            return (G.nodes[nid]["y"], G.nodes[nid]["x"])
+        return None
+
     wcoords = []
     for wi in range(len(wp) - 1):
         u2, v2 = wp[wi], wp[wi + 1]
-        ed2 = G.get_edge_data(u2, v2) or G.get_edge_data(v2, u2)
+        ed2 = None
+        if walk_g is not None:
+            ed2 = walk_g.get_edge_data(u2, v2) or walk_g.get_edge_data(v2, u2)
+        if not ed2:
+            ed2 = G.get_edge_data(u2, v2) or G.get_edge_data(v2, u2)
         if ed2:
             dd = ed2[0] if 0 in ed2 else list(ed2.values())[0]
             if "geometry" in dd:
                 for lon, lat in dd["geometry"].coords:
                     wcoords.append((lat, lon))
             else:
-                wcoords.append((G.nodes[u2]["y"], G.nodes[u2]["x"]))
+                c = _node_coords(u2)
+                if c is not None:
+                    wcoords.append(c)
         else:
-            wcoords.append((G.nodes[u2]["y"], G.nodes[u2]["x"]))
-    wcoords.append((G.nodes[wp[-1]]["y"], G.nodes[wp[-1]]["x"]))
+            c = _node_coords(u2)
+            if c is not None:
+                wcoords.append(c)
+    c_last = _node_coords(wp[-1])
+    if c_last is not None:
+        wcoords.append(c_last)
     return wcoords
 
 
@@ -934,10 +987,11 @@ def _add_unserved_layer(m, sol, mode_key):
     return fg
 
 
-def _add_crossing_markers(m, crossings_dict):
-    """Collect all mode crossings into one FeatureGroup.  Returns fg or None."""
+def _add_crossing_markers(m, crossings_dict, rejected_unsafe=None):
+    """Collect mode crossings (+ optional rejected synthetic points) into one FeatureGroup."""
     all_cxs = [(mk, cx) for mk, cxs in crossings_dict.items() for cx in cxs]
-    if not all_cxs:
+    rejected_unsafe = list(rejected_unsafe or [])
+    if not all_cxs and not rejected_unsafe:
         return None
     fg = FeatureGroup(name="Unsafe Crossings", show=True)
     seen = set()
@@ -951,14 +1005,120 @@ def _add_crossing_markers(m, crossings_dict):
             color="red", fill=True, fillColor="yellow", fillOpacity=0.9, weight=2,
             tooltip=f"Unsafe crossing \u2013 {cx['student_id']}",
         ).add_to(fg)
+    for rx in rejected_unsafe:
+        lk = (round(float(rx.get("lat", 0.0)), 6), round(float(rx.get("lon", 0.0)), 6))
+        if lk in seen:
+            continue
+        seen.add(lk)
+        folium.CircleMarker(
+            location=(float(rx.get("lat", 0.0)), float(rx.get("lon", 0.0))), radius=5,
+            color="#8e44ad", fill=True, fillColor="#ffb74d", fillOpacity=0.9, weight=2,
+            tooltip="Rejected synthetic crossing (unsafe road)",
+        ).add_to(fg)
+    fg.add_to(m)
+    return fg
+
+
+def _collect_used_synthetic_edge_keys(solutions, graph_for_walk):
+    """Return synthetic walk-edge keys that are actually used by student walks."""
+    walk_g = getattr(_eng, "_WALK_GRAPH", None)
+    if walk_g is None:
+        return set()
+
+    used = set()
+    for sol in (solutions or []):
+        if sol is None:
+            continue
+        for route in sol.routes:
+            for stop in route.stops:
+                if getattr(stop, "stop_type", None) == "school":
+                    continue
+                for student in getattr(stop, "assigned_students", []):
+                    sid = getattr(student, "id", None)
+                    if sid is None:
+                        continue
+                    start_node = sol.student_locations.get(sid)
+                    if start_node is None:
+                        continue
+                    path = walk_path_on_roads(graph_for_walk, start_node, stop.node_id)
+                    if len(path) < 2:
+                        continue
+                    for a, b in zip(path, path[1:]):
+                        ed = walk_g.get_edge_data(a, b) or walk_g.get_edge_data(b, a)
+                        if not ed:
+                            continue
+                        data = ed[0] if 0 in ed else list(ed.values())[0]
+                        if not data.get("synthetic_crossing", False):
+                            continue
+                        used.add((a, b) if a < b else (b, a))
+    return used
+
+
+def _add_synthetic_crossing_markers(m, crossings_list, show_only_used=False, used_edge_keys=None):
+    """Add synthetic crossings to the map with strong visual style.
+
+    If markers list is sparse (per-drive-node lazy mode), also derive crossings
+    from walk-graph edges tagged with synthetic_crossing=True.
+
+    When show_only_used=True, only synthetic edges touched by at least one
+    served student's walk path are displayed.
+    """
+    walk_g = getattr(_eng, "_WALK_GRAPH", None)
+    derived = []
+    segs = []
+    used_edge_keys = used_edge_keys or set()
+
+    if walk_g is not None:
+        for u, v, k, data in walk_g.edges(keys=True, data=True):
+            if not data.get("synthetic_crossing", False):
+                continue
+            edge_key = (u, v) if u < v else (v, u)
+            if show_only_used and edge_key not in used_edge_keys:
+                continue
+            if "geometry" in data:
+                coords = [(lat, lon) for lon, lat in data["geometry"].coords]
+            else:
+                coords = [
+                    (walk_g.nodes[u]["y"], walk_g.nodes[u]["x"]),
+                    (walk_g.nodes[v]["y"], walk_g.nodes[v]["x"]),
+                ]
+            segs.append(coords)
+            mid_lat = (coords[0][0] + coords[-1][0]) / 2
+            mid_lon = (coords[0][1] + coords[-1][1]) / 2
+            derived.append({"lat": mid_lat, "lon": mid_lon, "length_m": float(data.get("length", 0.0))})
+
+    all_markers = list(crossings_list or []) + derived
+    seen = set()
+    uniq = []
+    for cx in all_markers:
+        lk = (round(float(cx.get("lat", 0.0)), 6), round(float(cx.get("lon", 0.0)), 6))
+        if lk in seen:
+            continue
+        seen.add(lk)
+        uniq.append(cx)
+
+    fg = FeatureGroup(name=f"Synthetic Crossings ({len(uniq)})", show=False)
+    for seg in segs:
+        # Draw white halo first, then magenta line so crossings are obvious.
+        folium.PolyLine(seg, color="#ffffff", weight=8, opacity=0.85).add_to(fg)
+        folium.PolyLine(seg, color="#c2185b", weight=5, opacity=0.95).add_to(fg)
+
+    for cx in uniq:
+        length_m = float(cx.get("length_m", 0.0))
+        folium.CircleMarker(
+            location=(cx["lat"], cx["lon"]), radius=8,
+            color="#4a148c", fill=True, fillColor="#ffeb3b", fillOpacity=0.95, weight=2,
+            tooltip=f"Synthetic crossing ({length_m:.1f} m)",
+        ).add_to(fg)
     fg.add_to(m)
     return fg
 
 
 def _build_custom_layer_control_js(
-    map_var, fg_danger, fg_unclass,
+    map_var, fg_danger, fg_unclass, fg_walknet, fg_syn_cross,
     fgs_a, fgs_b, fgs_c,
     fg_crossings,
+    syn_label=None,
     fg_unserved_a=None, fg_unserved_b=None, fg_unserved_c=None,
     fg_cands_a=None,   fg_cands_b=None,   fg_cands_c=None,
 ):
@@ -972,6 +1132,9 @@ def _build_custom_layer_control_js(
     vc_r, vc_w = fgs_c[0].get_name(), fgs_c[1].get_name()
     v_danger  = fg_danger.get_name()
     v_unclass = fg_unclass.get_name()
+    v_walknet = fg_walknet.get_name()
+    v_syn = fg_syn_cross.get_name()
+    syn_label = syn_label or "Synthetic Crossings"
 
     crossings_row = ""
     if fg_crossings is not None:
@@ -1062,7 +1225,11 @@ def _build_custom_layer_control_js(
                 row('Dangerous Roads (unsafe to cross)',
                     [{v_danger}], map.hasLayer({v_danger}));
                 row('Unclassified Roads (no student placement)',
-                    [{v_unclass}], map.hasLayer({v_unclass}));{crossings_row}{unserved_rows}
+                    [{v_unclass}], map.hasLayer({v_unclass}));
+                row('Safe Walking Network (cyan streets)',
+                    [{v_walknet}], map.hasLayer({v_walknet}));
+                row('{syn_label}',
+                    [{v_syn}], map.hasLayer({v_syn}));{crossings_row}{unserved_rows}
                 sep();
                 var hdr2 = L.DomUtil.create('div', '', c);
                 hdr2.textContent = 'Candidate Stop Inspector';
@@ -1485,6 +1652,7 @@ def _build_metrics(meta, stage_walk, all_stats, crossings_dict,
     _debug_stats = {
         "step_times": step_times or {},
         "mode_breakdown": _dbg_modes,
+        "synthetic_crossings": _eng.get_synthetic_diagnostics(),
     }
 
     return {
@@ -1646,6 +1814,40 @@ def run(input_path=None, output_path=None, iterations=None):
     _eng._BALL_TREE_GRAPH_ID = None
     _eng._BALL_TREE_NODE_IDS = None
     _step_times["build_unconstrained_graph_s"] = round(_wtime.time() - _t0, 2)
+
+    # ── 3b. Optional walking graph (cached) ──
+    walk_cfg = meta.get("walk_graph", {}) if isinstance(meta, dict) else {}
+    use_walk_graph = bool(walk_cfg.get("enabled", False))
+    synth_cfg = (meta.get("synthetic_crossings") if isinstance(meta, dict) else None) or {
+        "enabled": False,
+        "strategy": "per_drive_node",
+        "max_per_drive_node": 1,
+        "min_dist_m": 6.0,
+        "max_dist_m": 20.0,
+        "max_per_node": 1,
+        "max_total": 1000,
+        "radius_km": 2.0,
+        "exclude_unsafe_roads": True,
+    }
+    G_walk = None
+    syn_list = []
+    if use_walk_graph:
+        print("[3b/7] Building WALK graph...")
+        _t0 = _wtime.time()
+        walk_radius_km = float(walk_cfg.get("radius_km", 5.0))
+        G_walk = setup_walk_graph(
+            base_data["meta"],
+            center=(school_cfg["latitude"], school_cfg["longitude"]),
+            radius_m=walk_radius_km * 1000.0,
+        )
+        synth_cfg["center_lat"] = school_cfg["latitude"]
+        synth_cfg["center_lon"] = school_cfg["longitude"]
+        synth_cfg.setdefault("radius_km", walk_radius_km)
+        syn_list = _eng.set_walk_graph(G_walk, synthetic_cfg=synth_cfg, drive_graph=G_con)
+        _step_times["build_walk_graph_s"] = round(_wtime.time() - _t0, 2)
+    else:
+        print("[3b/7] Walking graph disabled (meta.walk_graph.enabled=false)")
+        _eng.set_walk_graph(None, synthetic_cfg={"enabled": False})
 
     # ── 4. Mode A: Constrained ──
     # Walking BFS uses G_con (safety-restricted edges).
@@ -1819,6 +2021,15 @@ def run(input_path=None, output_path=None, iterations=None):
     fg_unclass.add_to(m)
     print(f"  Unclassified-road segments: {len(unclass_segs)}")
 
+    # Walk network layer
+    fg_walknet = FeatureGroup(name="Safe Walking Network", show=False)
+    walk_segs = _extract_walk_segments(G_con, center[0], center[1], radius_km=4.0, safe_only=True)
+    for seg in walk_segs:
+        folium.PolyLine(seg, color="#ffffff", weight=4, opacity=0.45).add_to(fg_walknet)
+        folium.PolyLine(seg, color="#00acc1", weight=2.5, opacity=0.9).add_to(fg_walknet)
+    fg_walknet.add_to(m)
+    print(f"  Safe walk-network segments: {len(walk_segs)}")
+
     crossings_dict, occupancies_dict, all_stats = {}, {}, {}
 
     # Clear path cache so rendering computes fresh turn-aware paths on G_unc
@@ -1864,7 +2075,24 @@ def run(input_path=None, output_path=None, iterations=None):
     for mk, (sol, cds, cdst, G_mk) in cand_data.items():
         fgs_cands[mk] = _add_candidate_layer(m, G_mk, mk, sol, cds, cdst)
 
-    fg_crossings = _add_crossing_markers(m, crossings_dict)
+    _rej_syn_unsafe = _eng.get_synthetic_rejected_unsafe()
+    fg_crossings = _add_crossing_markers(m, crossings_dict, rejected_unsafe=_rej_syn_unsafe)
+    _syn_markers = _eng.get_synthetic_crossings()
+    _show_only_used_syn = bool(synth_cfg.get("show_only_used", True))
+    _used_syn_edges = _collect_used_synthetic_edge_keys([sol_a, sol_b, sol_c], G_unc) if _show_only_used_syn else set()
+    fg_syn = _add_synthetic_crossing_markers(
+        m,
+        _syn_markers,
+        show_only_used=_show_only_used_syn,
+        used_edge_keys=_used_syn_edges,
+    )
+    _syn_label = getattr(fg_syn, "layer_name", "Synthetic Crossings")
+    print(f"  Synthetic crossings (markers): {len(_syn_markers)}")
+    if _show_only_used_syn:
+        print(f"  Synthetic crossings (used edges): {len(_used_syn_edges)}")
+    print(f"  Rejected synthetic (unsafe-road): {len(_rej_syn_unsafe)}")
+    if len(_syn_markers) == 0:
+        print("  WARNING: zero synthetic crossings were generated with current thresholds.")
 
     # Fill in empty FeatureGroups for any skipped modes so the layer control doesn't crash
     for _mk in ("A", "B", "C"):
@@ -1875,9 +2103,10 @@ def run(input_path=None, output_path=None, iterations=None):
     # Custom grouped layer control (title + 3 mode checkboxes, no radio buttons)
     map_var = f"map_{m._id}"
     ctrl_js = _build_custom_layer_control_js(
-        map_var, fg_danger, fg_unclass,
+        map_var, fg_danger, fg_unclass, fg_walknet, fg_syn,
         fgs["A"], fgs["B"], fgs["C"],
         fg_crossings,
+        syn_label=_syn_label,
         fg_unserved_a=fgs_unserved.get("A"),
         fg_unserved_b=fgs_unserved.get("B"),
         fg_unserved_c=fgs_unserved.get("C"),

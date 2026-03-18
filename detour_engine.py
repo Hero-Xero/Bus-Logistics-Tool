@@ -24,19 +24,1335 @@ from shapely.ops import substring
 
 # Cached undirected graph for pedestrian walking (ignores one-way, U-turn rules)
 _WALK_GRAPH = None
+# Synthetic crossing markers created for the walk graph
+_SYNTHETIC_CROSSINGS = []
+# Synthetic crossing config/state for on-demand generation per drive node
+_SYNTHETIC_CFG = {}
+_SYNTHETIC_TOTAL_ADDED = 0
+_SYNTHETIC_DRIVE_DONE = set()
+_SYNTHETIC_DIAGNOSTICS = {}
+_SYNTHETIC_REJECTED_UNSAFE = []
 # Cache: (student_node, stop_node) -> walk_distance_meters
 _WALK_DIST_CACHE = {}
+# Cache: (walk_graph_id, drive_node_id) -> mapped_walk_node_id
+_WALK_NODE_MAP_CACHE = {}
+# Walk-graph spatial hash for lightweight neighborhood lookup
+_WALK_SPATIAL_INDEX = None
+_WALK_SPATIAL_INDEX_META = None
+# Cache: (drive_graph_id, walk_node_id) -> nearest drive node id
+_WALK_TO_DRIVE_NODE_CACHE = {}
+# Cache: (drive_graph_id, drive_node_id) -> lane signature dict or None
+_DRIVE_NODE_SIGNATURE_CACHE = {}
+# Cache: (drive_graph_id, drive_node_id) -> bool safe-to-cross around node
+_DRIVE_NODE_SAFE_CACHE = {}
+# Cache for class/name-constrained signatures used by named-opposite strategy
+_DRIVE_NODE_FILTERED_SIG_CACHE = {}
 # Cache: (lat, lon) -> nearest_graph_node for walking
 _STUDENT_NODE_CACHE = {}
 
+_MAJOR_HIGHWAYS = {"motorway", "trunk", "primary", "secondary"}
+
+
+def _normalize_highway(hw):
+    """Normalize OSM highway value to a base type."""
+    if isinstance(hw, list):
+        hw = hw[0] if hw else ""
+    hw = str(hw or "").lower()
+    return hw[:-5] if hw.endswith("_link") else hw
+
+
+def _normalize_road_name(name):
+    """Normalize OSM road name into a stable lowercase token string."""
+    if isinstance(name, list):
+        name = name[0] if name else ""
+    txt = str(name or "").strip().lower()
+    if not txt:
+        return ""
+    # Normalize frequent separator/punctuation variance.
+    txt = txt.replace("-", " ").replace("_", " ").replace("/", " ")
+    while "  " in txt:
+        txt = txt.replace("  ", " ")
+    return txt
+
+
+def _angle_diff_deg(a, b):
+    """Smallest absolute angular difference in degrees (0..180)."""
+    return abs((a - b + 180.0) % 360.0 - 180.0)
+
+
+def _edge_bearing_fallback(graph, u, v):
+    """Compute bearing if edge metadata doesn't include one."""
+    try:
+        lat1, lon1 = graph.nodes[u]["y"], graph.nodes[u]["x"]
+        lat2, lon2 = graph.nodes[v]["y"], graph.nodes[v]["x"]
+    except Exception:
+        return None
+    dy = lat2 - lat1
+    dx = lon2 - lon1
+    if abs(dx) < 1e-12 and abs(dy) < 1e-12:
+        return None
+    ang = math.degrees(math.atan2(dx, dy))
+    return (ang + 360.0) % 360.0
+
+
+def _bearing_between_walk_nodes(walk_graph, u, v):
+    """Compute bearing from walk node u to walk node v."""
+    try:
+        lat1, lon1 = walk_graph.nodes[u]["y"], walk_graph.nodes[u]["x"]
+        lat2, lon2 = walk_graph.nodes[v]["y"], walk_graph.nodes[v]["x"]
+    except Exception:
+        return None
+    dy = lat2 - lat1
+    dx = lon2 - lon1
+    if abs(dx) < 1e-12 and abs(dy) < 1e-12:
+        return None
+    ang = math.degrees(math.atan2(dx, dy))
+    return (ang + 360.0) % 360.0
+
+
+def _walk_node_local_bearing(walk_graph, node_id):
+    """Return a representative local bearing at a walk node."""
+    try:
+        edges = list(walk_graph.edges(node_id, keys=True, data=True))
+    except Exception:
+        return None
+    best = None
+    for u, v, k, data in edges:
+        nbr = v if u == node_id else u
+        b = _bearing_between_walk_nodes(walk_graph, node_id, nbr)
+        if b is None:
+            continue
+        length = float(data.get("length", 1e9))
+        if best is None or length < best[0]:
+            best = (length, b)
+    return best[1] if best else None
+
+
+def _parallel_alignment_delta_deg(a, b):
+    """Return delta-to-parallel in degrees, where 0 means parallel.
+
+    Treat same-direction and opposite-direction as equally parallel.
+    """
+    d = _angle_diff_deg(a, b)
+    return min(d, abs(180.0 - d))
+
+
+def _is_parallel_carriageway_pair(
+    drive_graph,
+    walk_graph,
+    walk_node_a,
+    walk_node_b,
+    max_parallel_delta_deg=25.0,
+    require_same_highway=True,
+):
+    """True when both sides map to major carriageway lanes that are parallel.
+
+    Residential/local roads are excluded because signatures are extracted only
+    from major one-way highways in _drive_node_signature().
+    """
+    if drive_graph is None:
+        return False
+    d1 = _nearest_drive_node_for_walk_node(walk_node_a, walk_graph, drive_graph)
+    d2 = _nearest_drive_node_for_walk_node(walk_node_b, walk_graph, drive_graph)
+    if d1 is None or d2 is None or d1 == d2:
+        return False
+    s1 = _drive_node_signature(drive_graph, d1)
+    s2 = _drive_node_signature(drive_graph, d2)
+    if s1 is None or s2 is None:
+        return False
+    if require_same_highway and s1["highway"] != s2["highway"]:
+        return False
+    return _parallel_alignment_delta_deg(s1["bearing"], s2["bearing"]) <= float(max_parallel_delta_deg)
+
+
+def _drive_node_signature(drive_graph, drive_node_id):
+    """Extract representative lane signature near a drive node.
+
+    Signature is used to detect opposite-direction major-road carriageways.
+    """
+    ckey = (id(drive_graph), drive_node_id)
+    if ckey in _DRIVE_NODE_SIGNATURE_CACHE:
+        return _DRIVE_NODE_SIGNATURE_CACHE[ckey]
+
+    candidates = []
+
+    try:
+        out_edges = list(drive_graph.out_edges(drive_node_id, keys=True, data=True))
+        in_edges = list(drive_graph.in_edges(drive_node_id, keys=True, data=True))
+    except Exception:
+        out_edges = []
+        in_edges = []
+
+    for u, v, k, data in out_edges + in_edges:
+        hw = _normalize_highway(data.get("highway", ""))
+        if hw not in _MAJOR_HIGHWAYS:
+            continue
+        oneway = data.get("oneway", False)
+        if isinstance(oneway, str):
+            oneway = oneway.lower() in ("yes", "true", "1")
+        if not bool(oneway):
+            continue
+        bearing = data.get("bearing")
+        if bearing is None:
+            bearing = _edge_bearing_fallback(drive_graph, u, v)
+        if bearing is None:
+            continue
+        length = float(data.get("length", 1e9))
+        candidates.append((length, {
+            "highway": hw,
+            "bearing": float(bearing),
+            "oneway": True,
+        }))
+
+    sig = min(candidates, key=lambda x: x[0])[1] if candidates else None
+    _DRIVE_NODE_SIGNATURE_CACHE[ckey] = sig
+    return sig
+
+
+def _drive_node_filtered_signature(
+    drive_graph,
+    drive_node_id,
+    allowed_highways=None,
+    require_name=False,
+):
+    """Return a representative edge signature with highway/name filters."""
+    hw_key = tuple(sorted(allowed_highways or []))
+    ckey = (id(drive_graph), drive_node_id, hw_key, bool(require_name))
+    if ckey in _DRIVE_NODE_FILTERED_SIG_CACHE:
+        return _DRIVE_NODE_FILTERED_SIG_CACHE[ckey]
+
+    candidates = []
+    try:
+        out_edges = list(drive_graph.out_edges(drive_node_id, keys=True, data=True))
+        in_edges = list(drive_graph.in_edges(drive_node_id, keys=True, data=True))
+    except Exception:
+        out_edges = []
+        in_edges = []
+
+    for u, v, k, data in out_edges + in_edges:
+        hw = _normalize_highway(data.get("highway", ""))
+        if allowed_highways and hw not in allowed_highways:
+            continue
+        oneway = data.get("oneway", False)
+        if isinstance(oneway, str):
+            oneway = oneway.lower() in ("yes", "true", "1")
+        if not bool(oneway):
+            continue
+        road_name = _normalize_road_name(data.get("name", ""))
+        if require_name and not road_name:
+            continue
+        bearing = data.get("bearing")
+        if bearing is None:
+            bearing = _edge_bearing_fallback(drive_graph, u, v)
+        if bearing is None:
+            continue
+        edge_len = float(data.get("length", 1e9))
+        candidates.append((edge_len, {
+            "highway": hw,
+            "bearing": float(bearing),
+            "oneway": True,
+            "name": road_name,
+        }))
+
+    sig = min(candidates, key=lambda x: x[0])[1] if candidates else None
+    _DRIVE_NODE_FILTERED_SIG_CACHE[ckey] = sig
+    return sig
+
+
+def _drive_node_is_safe_to_cross(drive_graph, drive_node_id):
+    """Return True only when local drive edges around the node are safe to cross."""
+    ckey = (id(drive_graph), drive_node_id)
+    if ckey in _DRIVE_NODE_SAFE_CACHE:
+        return _DRIVE_NODE_SAFE_CACHE[ckey]
+
+    edge_iter = []
+    try:
+        edge_iter.extend(list(drive_graph.out_edges(drive_node_id, keys=True, data=True)))
+        edge_iter.extend(list(drive_graph.in_edges(drive_node_id, keys=True, data=True)))
+    except Exception:
+        _DRIVE_NODE_SAFE_CACHE[ckey] = True
+        return True
+
+    if not edge_iter:
+        _DRIVE_NODE_SAFE_CACHE[ckey] = True
+        return True
+
+    best_len = float("inf")
+    best_safe = True
+    for _u, _v, _k, data in edge_iter:
+        edge_len = float(data.get("length", 1e9))
+        edge_safe = bool(data.get("is_safe_to_cross", True))
+        if edge_len < best_len:
+            best_len = edge_len
+            best_safe = edge_safe
+
+    _DRIVE_NODE_SAFE_CACHE[ckey] = best_safe
+    return best_safe
+
+
+def _nearest_drive_node_for_walk_node(walk_node_id, walk_graph, drive_graph):
+    """Map a walk node to the nearest drive node (cached)."""
+    ckey = (id(drive_graph), walk_node_id)
+    cached = _WALK_TO_DRIVE_NODE_CACHE.get(ckey)
+    if cached is not None:
+        return cached
+    try:
+        lat = walk_graph.nodes[walk_node_id]["y"]
+        lon = walk_graph.nodes[walk_node_id]["x"]
+    except Exception:
+        return None
+    try:
+        # Build once, then query in O(log n) for many walk nodes.
+        _get_or_build_ball_tree(drive_graph)
+        dn = fast_nearest_node(drive_graph, lon, lat)
+    except Exception:
+        dn = None
+    _WALK_TO_DRIVE_NODE_CACHE[ckey] = dn
+    return dn
+
+
+def _is_dual_carriageway_pair(drive_graph, walk_graph, base_drive_node, other_walk_node, min_opposite_deg=150.0):
+    """Return True when nodes look like opposite lanes of a dual carriageway."""
+    base_sig = _drive_node_signature(drive_graph, base_drive_node)
+    if not base_sig:
+        return False
+
+    other_drive = _nearest_drive_node_for_walk_node(other_walk_node, walk_graph, drive_graph)
+    if other_drive is None or other_drive == base_drive_node:
+        return False
+
+    other_sig = _drive_node_signature(drive_graph, other_drive)
+    if not other_sig:
+        return False
+
+    # Keep same major road class and opposite movement direction.
+    if base_sig["highway"] != other_sig["highway"]:
+        return False
+    return _angle_diff_deg(base_sig["bearing"], other_sig["bearing"]) >= float(min_opposite_deg)
+
 def _get_walk_graph(graph):
-    """Get or create an undirected version of the road graph for walking.
-    Pedestrians can walk on any road regardless of direction.
-    Cached after first creation."""
+    """Get or create a graph for walking.
+
+    If a dedicated walk graph was set, use it. Otherwise, fall back
+    to an undirected version of the provided graph.
+    """
     global _WALK_GRAPH
-    if _WALK_GRAPH is None:
-        _WALK_GRAPH = graph.to_undirected()
+    if _WALK_GRAPH is not None:
+        return _WALK_GRAPH
+    _WALK_GRAPH = graph.to_undirected()
     return _WALK_GRAPH
+
+
+def _map_to_walk_node(node_id, drive_graph, walk_graph, generate_synthetic=False):
+    """Map a node from drive_graph to the nearest node in walk_graph."""
+    if node_id in walk_graph:
+        if generate_synthetic:
+            _ensure_synthetic_near_drive_node(node_id, drive_graph, walk_graph, node_id)
+        return node_id
+    cache_key = (id(walk_graph), node_id)
+    cached = _WALK_NODE_MAP_CACHE.get(cache_key)
+    if cached is not None:
+        if generate_synthetic:
+            _ensure_synthetic_near_drive_node(node_id, drive_graph, walk_graph, cached)
+        return cached
+    try:
+        lat = drive_graph.nodes[node_id]['y']
+        lon = drive_graph.nodes[node_id]['x']
+    except Exception:
+        return None
+    # Avoid building a second huge BallTree for walk graph (memory-heavy).
+    mapped = ox.nearest_nodes(walk_graph, lon, lat)
+    _WALK_NODE_MAP_CACHE[cache_key] = mapped
+    if generate_synthetic:
+        _ensure_synthetic_near_drive_node(node_id, drive_graph, walk_graph, mapped)
+    return mapped
+
+
+def _build_walk_spatial_index(walk_graph, cell_m):
+    """Build a lightweight spatial hash for walk nodes."""
+    global _WALK_SPATIAL_INDEX, _WALK_SPATIAL_INDEX_META
+    meta = (id(walk_graph), float(cell_m))
+    if _WALK_SPATIAL_INDEX is not None and _WALK_SPATIAL_INDEX_META == meta:
+        return _WALK_SPATIAL_INDEX
+
+    idx = {}
+    for n, d in walk_graph.nodes(data=True):
+        lat = d.get('y')
+        lon = d.get('x')
+        if lat is None or lon is None:
+            continue
+        y_m = lat * 111000.0
+        x_m = lon * 111000.0
+        gx = int(x_m // cell_m)
+        gy = int(y_m // cell_m)
+        idx.setdefault((gx, gy), []).append(n)
+
+    _WALK_SPATIAL_INDEX = idx
+    _WALK_SPATIAL_INDEX_META = meta
+    return idx
+
+
+def _ensure_synthetic_near_drive_node(drive_node_id, drive_graph, walk_graph, mapped_walk_node):
+    """Create a few synthetic crossings once per drive node (on-demand)."""
+    global _SYNTHETIC_TOTAL_ADDED
+    cfg = _SYNTHETIC_CFG or {}
+    strategy = str(cfg.get('strategy', 'per_drive_node')).lower()
+    if strategy == 'batch':
+        return
+    diag = _SYNTHETIC_DIAGNOSTICS
+    if diag:
+        diag["checked_drive_nodes"] = int(diag.get("checked_drive_nodes", 0)) + 1
+    if not cfg.get('enabled', False):
+        return
+    if drive_node_id in _SYNTHETIC_DRIVE_DONE:
+        return
+
+    max_total = int(cfg.get('max_total', 1000))
+    if _SYNTHETIC_TOTAL_ADDED >= max_total:
+        _SYNTHETIC_DRIVE_DONE.add(drive_node_id)
+        return
+
+    if mapped_walk_node not in walk_graph:
+        _SYNTHETIC_DRIVE_DONE.add(drive_node_id)
+        return
+
+    min_dist_m = float(cfg.get('min_dist_m', 6.0))
+    max_dist_m = float(cfg.get('max_dist_m', 20.0))
+    per_drive = int(cfg.get('max_per_drive_node', cfg.get('max_per_node', 1)))
+    require_dual = bool(cfg.get('require_dual_carriageway', True))
+    min_opposite_deg = float(cfg.get('min_opposite_bearing_deg', 150.0))
+    require_perp = bool(cfg.get('require_perpendicular_crossing', True))
+    min_perp_deg = float(cfg.get('min_perpendicular_deg', 60.0))
+    max_perp_deg = float(cfg.get('max_perpendicular_deg', 120.0))
+    max_existing_path_m = float(cfg.get('max_existing_path_m', 80.0))
+    exclude_unsafe_roads = bool(cfg.get('exclude_unsafe_roads', True))
+    base_sig = _drive_node_signature(drive_graph, drive_node_id)
+    if exclude_unsafe_roads and not _drive_node_is_safe_to_cross(drive_graph, drive_node_id):
+        if diag:
+            diag["rejected_unsafe_road"] = int(diag.get("rejected_unsafe_road", 0)) + 1
+        _SYNTHETIC_REJECTED_UNSAFE.append({
+            "lat": float(walk_graph.nodes[mapped_walk_node].get("y", 0.0)),
+            "lon": float(walk_graph.nodes[mapped_walk_node].get("x", 0.0)),
+            "reason": "base_drive_node_unsafe",
+        })
+        _SYNTHETIC_DRIVE_DONE.add(drive_node_id)
+        return
+    if require_dual and base_sig is None:
+        _SYNTHETIC_DRIVE_DONE.add(drive_node_id)
+        return
+    if per_drive <= 0:
+        _SYNTHETIC_DRIVE_DONE.add(drive_node_id)
+        return
+
+    node_lat = walk_graph.nodes[mapped_walk_node].get('y')
+    node_lon = walk_graph.nodes[mapped_walk_node].get('x')
+    if node_lat is None or node_lon is None:
+        _SYNTHETIC_DRIVE_DONE.add(drive_node_id)
+        return
+
+    cell_m = max(max_dist_m, 1.0)
+    idx = _build_walk_spatial_index(walk_graph, cell_m)
+    y_m = node_lat * 111000.0
+    x_m = node_lon * 111000.0
+    gx = int(x_m // cell_m)
+    gy = int(y_m // cell_m)
+
+    candidate_ids = []
+    for dx in (-1, 0, 1):
+        for dy in (-1, 0, 1):
+            candidate_ids.extend(idx.get((gx + dx, gy + dy), []))
+
+    best = []
+    for n2 in candidate_ids:
+        if diag:
+            diag["candidate_pairs_checked"] = int(diag.get("candidate_pairs_checked", 0)) + 1
+        if n2 == mapped_walk_node:
+            continue
+        if walk_graph.has_edge(mapped_walk_node, n2) or walk_graph.has_edge(n2, mapped_walk_node):
+            if diag:
+                diag["rejected_existing_edge"] = int(diag.get("rejected_existing_edge", 0)) + 1
+            continue
+        lat2 = walk_graph.nodes[n2].get('y')
+        lon2 = walk_graph.nodes[n2].get('x')
+        if lat2 is None or lon2 is None:
+            continue
+        dist_m = math.hypot((node_lat - lat2) * 111000.0, (node_lon - lon2) * 111000.0)
+        if dist_m < min_dist_m or dist_m > max_dist_m:
+            if diag:
+                diag["rejected_distance"] = int(diag.get("rejected_distance", 0)) + 1
+            continue
+        if exclude_unsafe_roads:
+            other_drive = _nearest_drive_node_for_walk_node(n2, walk_graph, drive_graph)
+            if other_drive is None or not _drive_node_is_safe_to_cross(drive_graph, other_drive):
+                if diag:
+                    diag["rejected_unsafe_road"] = int(diag.get("rejected_unsafe_road", 0)) + 1
+                _SYNTHETIC_REJECTED_UNSAFE.append({
+                    "lat": (node_lat + lat2) / 2,
+                    "lon": (node_lon + lon2) / 2,
+                    "reason": "candidate_pair_unsafe",
+                })
+                continue
+        if require_dual and not _is_dual_carriageway_pair(
+            drive_graph, walk_graph, drive_node_id, n2, min_opposite_deg=min_opposite_deg
+        ):
+            if diag:
+                diag["rejected_lane_pair"] = int(diag.get("rejected_lane_pair", 0)) + 1
+            continue
+        if require_perp and base_sig is not None:
+            cross_bearing = _bearing_between_walk_nodes(walk_graph, mapped_walk_node, n2)
+            if cross_bearing is None:
+                if diag:
+                    diag["rejected_missing_cross_bearing"] = int(diag.get("rejected_missing_cross_bearing", 0)) + 1
+                continue
+            cross_diff = _angle_diff_deg(base_sig["bearing"], cross_bearing)
+            if cross_diff < min_perp_deg or cross_diff > max_perp_deg:
+                if diag:
+                    diag["rejected_not_perpendicular"] = int(diag.get("rejected_not_perpendicular", 0)) + 1
+                continue
+        if max_existing_path_m > 0:
+            try:
+                existing_len = nx.shortest_path_length(walk_graph, mapped_walk_node, n2, weight='length')
+                if existing_len <= max_existing_path_m:
+                    if diag:
+                        diag["rejected_existing_walk_short"] = int(diag.get("rejected_existing_walk_short", 0)) + 1
+                    continue
+            except (nx.NetworkXNoPath, nx.NodeNotFound):
+                pass
+        best.append((dist_m, n2, lat2, lon2))
+
+    best.sort(key=lambda x: x[0])
+    added_here = 0
+    for dist_m, n2, lat2, lon2 in best:
+        if added_here >= per_drive or _SYNTHETIC_TOTAL_ADDED >= max_total:
+            break
+        if walk_graph.has_edge(mapped_walk_node, n2) or walk_graph.has_edge(n2, mapped_walk_node):
+            continue
+        walk_graph.add_edge(mapped_walk_node, n2, length=dist_m, travel_time=dist_m / 80.0,
+                            synthetic_crossing=True, is_safe_to_cross=True)
+        _SYNTHETIC_CROSSINGS.append({
+            'lat': (node_lat + lat2) / 2,
+            'lon': (node_lon + lon2) / 2,
+            'length_m': round(dist_m, 1),
+            'drive_node_id': drive_node_id,
+        })
+        _SYNTHETIC_TOTAL_ADDED += 1
+        if diag:
+            diag["added"] = int(diag.get("added", 0)) + 1
+        added_here += 1
+
+    _SYNTHETIC_DRIVE_DONE.add(drive_node_id)
+
+
+def build_synthetic_crossings(walk_graph, min_dist_m=6.0, max_dist_m=20.0,
+                              max_per_node=1, max_total=2000,
+                              center_lat=None, center_lon=None, radius_km=None,
+                              require_parallel_roads=False, max_parallel_delta_deg=25.0,
+                              drive_graph=None, require_same_highway=True,
+                              exclude_unsafe_roads=True):
+    """Create synthetic crossings between nearby, disconnected walk nodes.
+
+    Returns a list of marker dicts with lat/lon for visualization.
+    """
+    crossings = []
+    diag = {
+        "strategy": "batch",
+        "candidate_nodes": 0,
+        "candidate_pairs_checked": 0,
+        "rejected_existing_edge": 0,
+        "rejected_distance": 0,
+        "rejected_non_carriageway": 0,
+        "rejected_highway_mismatch": 0,
+        "rejected_not_parallel": 0,
+        "rejected_unsafe_road": 0,
+        "added": 0,
+    }
+
+    if walk_graph is None:
+        return crossings
+
+    # Memory-light spatial hashing (no global coordinate arrays / BallTree).
+    cos_lat_ref = math.cos(math.radians(center_lat)) if center_lat is not None else 1.0
+    cell_m = max(max_dist_m, 1.0)
+    buckets = {}
+    candidates = []
+    max_candidates = max(max_total * 30, 20000)
+
+    for n, data in walk_graph.nodes(data=True):
+        if len(candidates) >= max_candidates:
+            break
+        lat = data.get('y')
+        lon = data.get('x')
+        if lat is None or lon is None:
+            continue
+        if center_lat is not None and center_lon is not None and radius_km is not None:
+            dlat = abs(lat - center_lat) * 111.0
+            dlon = abs(lon - center_lon) * 111.0 * cos_lat_ref
+            if math.sqrt(dlat * dlat + dlon * dlon) > radius_km:
+                continue
+        y_m = lat * 111000.0
+        x_m = lon * 111000.0 * cos_lat_ref
+        gx = int(x_m // cell_m)
+        gy = int(y_m // cell_m)
+        idx = len(candidates)
+        candidates.append((n, lat, lon, x_m, y_m))
+        buckets.setdefault((gx, gy), []).append(idx)
+
+    diag["candidate_nodes"] = len(candidates)
+
+    if not candidates:
+        return crossings
+
+    node_sig = {}
+    node_safe = {}
+    if require_parallel_roads and drive_graph is not None:
+        for node_id, lat, lon, x_m, y_m in candidates:
+            dn = _nearest_drive_node_for_walk_node(node_id, walk_graph, drive_graph)
+            node_sig[node_id] = _drive_node_signature(drive_graph, dn) if dn is not None else None
+            if exclude_unsafe_roads:
+                node_safe[node_id] = _drive_node_is_safe_to_cross(drive_graph, dn) if dn is not None else False
+    elif exclude_unsafe_roads and drive_graph is not None:
+        for node_id, lat, lon, x_m, y_m in candidates:
+            dn = _nearest_drive_node_for_walk_node(node_id, walk_graph, drive_graph)
+            node_safe[node_id] = _drive_node_is_safe_to_cross(drive_graph, dn) if dn is not None else False
+
+    seen_pairs = set()
+    added = 0
+    for node_id, lat, lon, x_m, y_m in candidates:
+        if added >= max_total:
+            break
+        gx = int(x_m // cell_m)
+        gy = int(y_m // cell_m)
+        chosen = 0
+        for dx in (-1, 0, 1):
+            if chosen >= max_per_node or added >= max_total:
+                break
+            for dy in (-1, 0, 1):
+                if chosen >= max_per_node or added >= max_total:
+                    break
+                for j in buckets.get((gx + dx, gy + dy), []):
+                    diag["candidate_pairs_checked"] += 1
+                    n2, lat2, lon2, x2, y2 = candidates[j]
+                    if n2 == node_id:
+                        continue
+                    pair = (node_id, n2) if node_id < n2 else (n2, node_id)
+                    if pair in seen_pairs:
+                        continue
+                    seen_pairs.add(pair)
+                    if walk_graph.has_edge(node_id, n2) or walk_graph.has_edge(n2, node_id):
+                        diag["rejected_existing_edge"] += 1
+                        continue
+                    dist_m = math.hypot(x_m - x2, y_m - y2)
+                    if dist_m < min_dist_m or dist_m > max_dist_m:
+                        diag["rejected_distance"] += 1
+                        continue
+                    if exclude_unsafe_roads and drive_graph is not None:
+                        if not node_safe.get(node_id, False) or not node_safe.get(n2, False):
+                            diag["rejected_unsafe_road"] += 1
+                            _SYNTHETIC_REJECTED_UNSAFE.append({
+                                "lat": (lat + lat2) / 2,
+                                "lon": (lon + lon2) / 2,
+                                "reason": "candidate_pair_unsafe",
+                            })
+                            continue
+                    if require_parallel_roads:
+                        s1 = node_sig.get(node_id)
+                        s2 = node_sig.get(n2)
+                        if s1 is None or s2 is None:
+                            diag["rejected_non_carriageway"] += 1
+                            continue
+                        if require_same_highway and s1["highway"] != s2["highway"]:
+                            diag["rejected_highway_mismatch"] += 1
+                            continue
+                        if _parallel_alignment_delta_deg(s1["bearing"], s2["bearing"]) > float(max_parallel_delta_deg):
+                            diag["rejected_not_parallel"] += 1
+                            continue
+
+                    walk_graph.add_edge(node_id, n2, length=dist_m, travel_time=dist_m / 80.0,
+                                        synthetic_crossing=True, is_safe_to_cross=True)
+                    crossings.append({
+                        "lat": (lat + lat2) / 2,
+                        "lon": (lon + lon2) / 2,
+                        "length_m": round(dist_m, 1),
+                    })
+                    added += 1
+                    diag["added"] += 1
+                    chosen += 1
+                    if chosen >= max_per_node:
+                        break
+    global _SYNTHETIC_DIAGNOSTICS
+    _SYNTHETIC_DIAGNOSTICS = diag
+    return crossings
+
+
+def build_named_opposite_direction_crossings(
+    walk_graph,
+    drive_graph,
+    min_dist_m=6.0,
+    max_dist_m=50.0,
+    min_opposite_bearing_deg=150.0,
+    max_crossing_angle_delta_deg=30.0,
+    min_spacing_m=100.0,
+    min_spacing_per_road_m=None,
+    max_per_road=None,
+    max_total=2000,
+    center_lat=None,
+    center_lon=None,
+    radius_km=None,
+    road_search_radius_m=60.0,
+):
+    """Build crossings from secondary/tertiary dual carriageways.
+
+        APPROACH (Low-memory A->B gap filling):
+        1. Find secondary/tertiary one-way named drive edges.
+        2. Group by road name and split into opposite carriageway groups A/B.
+        3. Stream walk nodes and classify nearby nodes by nearest side (A or B).
+        4. For each existing walk node on side A:
+             - Try to find an existing side-B node within distance limits and with
+                 crossing bearing close to perpendicular to road axis.
+             - If found: create crossing A<->B.
+             - If not found: create synthetic side-B node at perpendicular projection
+                 onto side-B carriageway geometry, then create crossing A<->synthetic B.
+    """
+    crossings = []
+    diag = {
+        "strategy": "named_opposite_secondary_tertiary",
+        "candidate_drive_edges": 0,
+        "candidate_walk_nodes": 0,
+        "roads_found": 0,
+        "roads_with_both_directions": 0,
+        "walk_nodes_checked": 0,
+        "valid_pairs_found": 0,
+        "rejected_existing_edge": 0,
+        "rejected_distance": 0,
+        "rejected_spacing": 0,
+        "rejected_bad_angle": 0,
+        "rejected_no_projection": 0,
+        "synthetic_created": 0,
+        "added": 0,
+    }
+
+    global _SYNTHETIC_DIAGNOSTICS
+    if walk_graph is None or drive_graph is None:
+        _SYNTHETIC_DIAGNOSTICS = diag
+        return crossings
+
+    cos_lat_ref = math.cos(math.radians(center_lat)) if center_lat is not None else 1.0
+    allowed_hw = {"secondary", "tertiary"}
+
+    def _normalize_hw(hw):
+        if isinstance(hw, list):
+            hw = hw[0] if hw else ""
+        return str(hw).lower().strip()
+
+    def _normalize_name(name):
+        if isinstance(name, list):
+            name = name[0] if name else ""
+        return str(name).strip() if name else ""
+
+    def _in_radius(lat, lon):
+        if center_lat is None or center_lon is None or radius_km is None:
+            return True
+        dlat = abs(lat - center_lat) * 111.0
+        dlon = abs(lon - center_lon) * 111.0 * cos_lat_ref
+        return math.sqrt(dlat * dlat + dlon * dlon) <= radius_km
+
+    def _to_meters(lat, lon):
+        return lon * 111000.0 * cos_lat_ref, lat * 111000.0
+
+    def _from_meters(x_m, y_m):
+        return y_m / 111000.0, x_m / (111000.0 * cos_lat_ref)
+
+    def _bearing_from_xy(x1, y1, x2, y2):
+        dx = x2 - x1
+        dy = y2 - y1
+        if abs(dx) < 1e-9 and abs(dy) < 1e-9:
+            return None
+        return math.degrees(math.atan2(dx, dy)) % 360.0
+
+    def _mean_bearing_deg(bearings):
+        if not bearings:
+            return 0.0
+        sx, sy = 0.0, 0.0
+        for b in bearings:
+            r = math.radians(float(b))
+            sx += math.sin(r)
+            sy += math.cos(r)
+        if abs(sx) < 1e-12 and abs(sy) < 1e-12:
+            return float(bearings[0])
+        return math.degrees(math.atan2(sx, sy)) % 360.0
+
+    def _perp_delta_deg(crossing_bearing, road_axis_bearing):
+        p1 = (road_axis_bearing + 90.0) % 360.0
+        p2 = (road_axis_bearing + 270.0) % 360.0
+        return min(_angle_diff_deg(crossing_bearing, p1), _angle_diff_deg(crossing_bearing, p2))
+
+    # Step 1: Collect drive edges
+    drive_edges = []
+    for u, v, key, data in drive_graph.edges(keys=True, data=True):
+        hw = _normalize_hw(data.get("highway", ""))
+        if hw not in allowed_hw:
+            continue
+
+        oneway = data.get("oneway", False)
+        if isinstance(oneway, str):
+            oneway = oneway.lower() in ("yes", "true", "1")
+        if not oneway:
+            continue
+
+        name = _normalize_name(data.get("name", ""))
+        if not name:
+            continue
+
+        u_data = drive_graph.nodes[u]
+        v_data = drive_graph.nodes[v]
+        u_lat, u_lon = u_data.get("y"), u_data.get("x")
+        v_lat, v_lon = v_data.get("y"), v_data.get("x")
+
+        if None in (u_lat, u_lon, v_lat, v_lon):
+            continue
+
+        mid_lat = (u_lat + v_lat) / 2.0
+        mid_lon = (u_lon + v_lon) / 2.0
+        if not _in_radius(mid_lat, mid_lon):
+            continue
+
+        bearing = data.get("bearing")
+        if bearing is None:
+            dlat = (v_lat - u_lat) * 111000.0
+            dlon = (v_lon - u_lon) * 111000.0 * cos_lat_ref
+            bearing = math.degrees(math.atan2(dlon, dlat)) % 360.0
+
+        u_x, u_y = _to_meters(u_lat, u_lon)
+        v_x, v_y = _to_meters(v_lat, v_lon)
+        length_m = math.hypot(v_x - u_x, v_y - u_y)
+
+        drive_edges.append({
+            "u": u, "v": v, "key": key,
+            "u_lat": u_lat, "u_lon": u_lon,
+            "v_lat": v_lat, "v_lon": v_lon,
+            "u_x": u_x, "u_y": u_y,
+            "v_x": v_x, "v_y": v_y,
+            "length_m": length_m,
+            "name": name, "highway": hw,
+            "bearing": float(bearing),
+        })
+
+    diag["candidate_drive_edges"] = len(drive_edges)
+
+    if not drive_edges:
+        _SYNTHETIC_DIAGNOSTICS = diag
+        return crossings
+
+    # Step 2: Group drive edges by (name, highway)
+    road_groups = {}
+    for e in drive_edges:
+        road_key = (e["name"], e["highway"])
+        road_groups.setdefault(road_key, []).append(e)
+    diag["roads_found"] = len(road_groups)
+
+    # Build a one-time lightweight spatial hash for walk nodes.
+    # This avoids scanning the entire walk graph for every road, which can
+    # cause severe RAM/CPU pressure in large previews.
+    cell_m = max(float(road_search_radius_m), float(max_dist_m), 10.0)
+    walk_nodes_index = []
+    walk_buckets = {}
+    for n, ndata in walk_graph.nodes(data=True):
+        lat = ndata.get("y")
+        lon = ndata.get("x")
+        if lat is None or lon is None:
+            continue
+        x, y = _to_meters(lat, lon)
+        idx = len(walk_nodes_index)
+        walk_nodes_index.append((n, lat, lon, x, y))
+        gx = int(math.floor(x / cell_m))
+        gy = int(math.floor(y / cell_m))
+        walk_buckets.setdefault((gx, gy), []).append(idx)
+
+    diag["candidate_walk_nodes"] = len(walk_nodes_index)
+
+    all_debug_edges = []
+    all_debug_walk_nodes = []  # Store walk nodes used in crossings
+    all_debug_synthetic_nodes = []  # Store synthetic nodes created
+    existing_crossings = set()
+
+    synthetic_node_counter = [0]
+
+    def _create_synthetic_node(lat, lon):
+        """Create a new synthetic walk node."""
+        node_id = f"synth_crossing_{synthetic_node_counter[0]}"
+        synthetic_node_counter[0] += 1
+        walk_graph.add_node(node_id, y=lat, x=lon, synthetic=True)
+        x_m, y_m = _to_meters(lat, lon)
+        return {
+            "node": node_id,
+            "lat": lat,
+            "lon": lon,
+            "x": x_m,
+            "y": y_m,
+        }
+    for u, v, k, data in walk_graph.edges(keys=True, data=True):
+        if data.get("synthetic_crossing"):
+            existing_crossings.add(tuple(sorted([u, v], key=str)))
+
+    all_crossing_midpoints = []
+
+    def _query_walk_nodes_bbox(min_x, max_x, min_y, max_y):
+        """Yield walk-node records whose metric coordinates fall in bbox."""
+        gx0 = int(math.floor(min_x / cell_m))
+        gx1 = int(math.floor(max_x / cell_m))
+        gy0 = int(math.floor(min_y / cell_m))
+        gy1 = int(math.floor(max_y / cell_m))
+        seen = set()
+        for gx in range(gx0, gx1 + 1):
+            for gy in range(gy0, gy1 + 1):
+                for idx in walk_buckets.get((gx, gy), []):
+                    if idx in seen:
+                        continue
+                    seen.add(idx)
+                    n, lat, lon, x, y = walk_nodes_index[idx]
+                    if min_x <= x <= max_x and min_y <= y <= max_y:
+                        yield {
+                            "node": n,
+                            "lat": lat,
+                            "lon": lon,
+                            "x": x,
+                            "y": y,
+                        }
+
+    # Helper: Find nearest point on a line segment
+    def _nearest_point_on_segment(px, py, ax, ay, bx, by):
+        """Return nearest point on segment AB to point P."""
+        abx, aby = bx - ax, by - ay
+        apx, apy = px - ax, py - ay
+        ab_len_sq = abx * abx + aby * aby
+        if ab_len_sq < 1e-9:
+            return ax, ay
+        t = max(0, min(1, (apx * abx + apy * aby) / ab_len_sq))
+        return ax + t * abx, ay + t * aby
+
+    # Step 3: For each road, process A-side walk nodes and match/project to B.
+    for road_key, edges in road_groups.items():
+        if len(edges) < 2:
+            continue
+
+        # Split into opposite bearing groups
+        ref_bearing = edges[0]["bearing"]
+        edges_a, edges_b = [], []
+        for e in edges:
+            angle_diff = _angle_diff_deg(e["bearing"], ref_bearing)
+            if angle_diff < 90.0:
+                e["direction"] = "A"
+                edges_a.append(e)
+            else:
+                e["direction"] = "B"
+                edges_b.append(e)
+
+        if not edges_a or not edges_b:
+            continue
+
+        avg_bearing_a = sum(e["bearing"] for e in edges_a) / len(edges_a)
+        avg_bearing_b = sum(e["bearing"] for e in edges_b) / len(edges_b)
+        if _angle_diff_deg(avg_bearing_a, avg_bearing_b) < min_opposite_bearing_deg:
+            continue
+
+        diag["roads_with_both_directions"] += 1
+
+        # Store edges for debug visualization
+        for e in edges_a + edges_b:
+            all_debug_edges.append({
+                "u_lat": e["u_lat"], "u_lon": e["u_lon"],
+                "v_lat": e["v_lat"], "v_lon": e["v_lon"],
+                "name": e["name"], "highway": e["highway"],
+                "bearing": e["bearing"], "direction": e["direction"],
+            })
+
+        axis_bearing = _mean_bearing_deg([e["bearing"] for e in edges_a])
+
+        segs_a = []
+        for e in edges_a:
+            segs_a.append((e["u_x"], e["u_y"], e["v_x"], e["v_y"]))
+
+        segs_b = []
+        for e in edges_b:
+            seg_bearing = _bearing_from_xy(e["u_x"], e["u_y"], e["v_x"], e["v_y"])
+            if seg_bearing is None:
+                seg_bearing = axis_bearing
+            segs_b.append((e["u_x"], e["u_y"], e["v_x"], e["v_y"], seg_bearing))
+
+        if not segs_a or not segs_b:
+            continue
+
+        # Lightweight per-road candidate containers only.
+        walk_nodes_a = []
+        walk_nodes_b = []
+
+        # Spatial prefilter using road-side bounding boxes.
+        min_x_a = min(min(ax, bx) for ax, ay, bx, by in segs_a) - float(road_search_radius_m)
+        max_x_a = max(max(ax, bx) for ax, ay, bx, by in segs_a) + float(road_search_radius_m)
+        min_y_a = min(min(ay, by) for ax, ay, bx, by in segs_a) - float(road_search_radius_m)
+        max_y_a = max(max(ay, by) for ax, ay, bx, by in segs_a) + float(road_search_radius_m)
+
+        min_x_b = min(min(ax, bx) for ax, ay, bx, by, bb in segs_b) - float(road_search_radius_m)
+        max_x_b = max(max(ax, bx) for ax, ay, bx, by, bb in segs_b) + float(road_search_radius_m)
+        min_y_b = min(min(ay, by) for ax, ay, bx, by, bb in segs_b) - float(road_search_radius_m)
+        max_y_b = max(max(ay, by) for ax, ay, bx, by, bb in segs_b) + float(road_search_radius_m)
+
+        query_min_x = min(min_x_a, min_x_b)
+        query_max_x = max(max_x_a, max_x_b)
+        query_min_y = min(min_y_a, min_y_b)
+        query_max_y = max(max_y_a, max_y_b)
+
+        for rec in _query_walk_nodes_bbox(query_min_x, query_max_x, query_min_y, query_max_y):
+            x = rec["x"]
+            y = rec["y"]
+
+            best_a_dist = float("inf")
+            for ax, ay, bx, by in segs_a:
+                qx, qy = _nearest_point_on_segment(x, y, ax, ay, bx, by)
+                d = math.hypot(x - qx, y - qy)
+                if d < best_a_dist:
+                    best_a_dist = d
+
+            best_b_dist = float("inf")
+            best_b_proj = None
+            best_b_seg_bearing = None
+            for ax, ay, bx, by, seg_bearing in segs_b:
+                qx, qy = _nearest_point_on_segment(x, y, ax, ay, bx, by)
+                d = math.hypot(x - qx, y - qy)
+                if d < best_b_dist:
+                    best_b_dist = d
+                    best_b_proj = (qx, qy)
+                    best_b_seg_bearing = seg_bearing
+
+            if min(best_a_dist, best_b_dist) > float(road_search_radius_m):
+                continue
+
+            rec["nearest_b_proj"] = best_b_proj
+            rec["nearest_b_seg_bearing"] = best_b_seg_bearing
+
+            # Classify to nearest carriageway side.
+            if best_a_dist <= best_b_dist:
+                walk_nodes_a.append(rec)
+            else:
+                walk_nodes_b.append(rec)
+
+        if not walk_nodes_a:
+            continue
+
+        paired_nodes_b = set()
+        road_midpoints = []
+
+        for wn_a in walk_nodes_a:
+            if max_per_road is not None and len(road_midpoints) >= int(max_per_road):
+                break
+
+            diag["walk_nodes_checked"] += 1
+
+            # Try to match an existing side-B node by distance and angle.
+            best_match = None
+            best_dist = float("inf")
+            best_angle_delta = float("inf")
+            had_within_dist = False
+            had_angle_ok = False
+
+            for wn_b in walk_nodes_b:
+                if wn_b["node"] in paired_nodes_b:
+                    continue
+
+                dist = math.hypot(wn_a["x"] - wn_b["x"], wn_a["y"] - wn_b["y"])
+                if dist < float(min_dist_m) or dist > float(max_dist_m):
+                    continue
+
+                had_within_dist = True
+
+                cross_bearing = _bearing_from_xy(wn_a["x"], wn_a["y"], wn_b["x"], wn_b["y"])
+                if cross_bearing is None:
+                    continue
+                angle_delta = _perp_delta_deg(cross_bearing, axis_bearing)
+                if angle_delta > float(max_crossing_angle_delta_deg):
+                    continue
+                had_angle_ok = True
+
+                if dist < best_dist or (abs(dist - best_dist) < 1e-6 and angle_delta < best_angle_delta):
+                    best_dist = dist
+                    best_match = wn_b
+                    best_angle_delta = angle_delta
+
+            node_a = wn_a
+            node_b = None
+            created_synthetic = False
+
+            if best_match:
+                node_b = best_match
+                paired_nodes_b.add(best_match["node"])
+            else:
+                if not had_within_dist:
+                    diag["rejected_distance"] += 1
+                elif not had_angle_ok:
+                    diag["rejected_bad_angle"] += 1
+
+                # Fallback: project A onto side-B carriageway and synthesize there.
+                proj = wn_a.get("nearest_b_proj")
+                if proj is None:
+                    diag["rejected_no_projection"] += 1
+                    continue
+
+                synth_x, synth_y = proj
+                pair_dist_proj = math.hypot(node_a["x"] - synth_x, node_a["y"] - synth_y)
+                if pair_dist_proj < float(min_dist_m):
+                    diag["rejected_distance"] += 1
+                    continue
+
+                cross_bearing = _bearing_from_xy(node_a["x"], node_a["y"], synth_x, synth_y)
+                if cross_bearing is None:
+                    diag["rejected_bad_angle"] += 1
+                    continue
+                angle_delta = _perp_delta_deg(cross_bearing, axis_bearing)
+                if angle_delta > float(max_crossing_angle_delta_deg):
+                    diag["rejected_bad_angle"] += 1
+                    continue
+
+                # CHECK SPACING BEFORE CREATING SYNTHETIC NODE
+                mid_x = (node_a["x"] + synth_x) / 2
+                mid_y = (node_a["y"] + synth_y) / 2
+                too_close_global = any(
+                    math.hypot(mid_x - ox, mid_y - oy) < float(min_spacing_m)
+                    for ox, oy in all_crossing_midpoints
+                )
+                per_road_spacing = (
+                    float(min_spacing_per_road_m)
+                    if min_spacing_per_road_m is not None
+                    else float(min_spacing_m)
+                )
+                too_close_road = any(
+                    math.hypot(mid_x - ox, mid_y - oy) < per_road_spacing
+                    for ox, oy in road_midpoints
+                )
+                if too_close_global or too_close_road:
+                    diag["rejected_spacing"] += 1
+                    continue
+
+                # Now safe to create synthetic node
+                s_lat, s_lon = _from_meters(synth_x, synth_y)
+                node_b = _create_synthetic_node(s_lat, s_lon)
+                created_synthetic = True
+                diag["synthetic_created"] += 1
+
+                all_debug_synthetic_nodes.append({
+                    **node_b,
+                    "direction": "B",
+                    "road_name": road_key[0],
+                })
+
+            # Now create the crossing edge
+            n1, n2 = node_a["node"], node_b["node"]
+            edge_key = tuple(sorted([n1, n2], key=str))
+
+            if walk_graph.has_edge(n1, n2) or edge_key in existing_crossings:
+                diag["rejected_existing_edge"] += 1
+                continue
+
+            pair_dist = math.hypot(node_a["x"] - node_b["x"], node_a["y"] - node_b["y"])
+            mid_x = (node_a["x"] + node_b["x"]) / 2
+            mid_y = (node_a["y"] + node_b["y"]) / 2
+
+            # For non-synthetic, still check spacing
+            if not created_synthetic:
+                too_close_global = any(
+                    math.hypot(mid_x - ox, mid_y - oy) < float(min_spacing_m)
+                    for ox, oy in all_crossing_midpoints
+                )
+                per_road_spacing = (
+                    float(min_spacing_per_road_m)
+                    if min_spacing_per_road_m is not None
+                    else float(min_spacing_m)
+                )
+                too_close_road = any(
+                    math.hypot(mid_x - ox, mid_y - oy) < per_road_spacing
+                    for ox, oy in road_midpoints
+                )
+                if too_close_global or too_close_road:
+                    diag["rejected_spacing"] += 1
+                    continue
+
+            diag["valid_pairs_found"] += 1
+
+            # Store nodes for debug visualization
+            all_debug_walk_nodes.append({
+                "node": node_a["node"],
+                "lat": node_a["lat"],
+                "lon": node_a["lon"],
+                "direction": "A",
+                "road_name": road_key[0],
+            })
+            if not created_synthetic:
+                all_debug_walk_nodes.append({
+                    "node": node_b["node"],
+                    "lat": node_b["lat"],
+                    "lon": node_b["lon"],
+                    "direction": "B",
+                    "road_name": road_key[0],
+                })
+
+            # Add crossing edge
+            walk_graph.add_edge(
+                n1, n2,
+                length=pair_dist,
+                travel_time=pair_dist / 80.0,
+                synthetic_crossing=True,
+                is_safe_to_cross=True,
+                crossing_rule="named_opposite_secondary_tertiary",
+                road_name=road_key[0],
+                road_class=road_key[1],
+            )
+            existing_crossings.add(edge_key)
+            all_crossing_midpoints.append((mid_x, mid_y))
+            road_midpoints.append((mid_x, mid_y))
+
+            mid_lat = (node_a["lat"] + node_b["lat"]) / 2
+            mid_lon = (node_a["lon"] + node_b["lon"]) / 2
+            crossings.append({
+                "lat": mid_lat,
+                "lon": mid_lon,
+                "length_m": round(pair_dist, 1),
+                "road_name": road_key[0],
+                "road_class": road_key[1],
+            })
+            diag["added"] += 1
+
+            if len(crossings) >= int(max_total):
+                break
+
+        if len(crossings) >= int(max_total):
+            break
+
+    diag["synthetic_nodes_created"] = len(all_debug_synthetic_nodes)
+    _SYNTHETIC_DIAGNOSTICS = diag
+    _store_debug_edges(all_debug_edges, all_debug_walk_nodes, all_debug_synthetic_nodes)
+    return crossings
+
+
+def _store_debug_edges(edges, walk_nodes=None, synthetic_nodes=None):
+    """Store drive edges, walk nodes, and synthetic nodes for debug visualization."""
+    global _CROSSING_DEBUG_CANDIDATES
+    _CROSSING_DEBUG_CANDIDATES = {
+        "edges": edges,
+        "walk_nodes": walk_nodes or [],
+        "synthetic_nodes": synthetic_nodes or [],
+        "candidates": [],
+        "direction_stats": {},
+    }
+
+
+_CROSSING_DEBUG_CANDIDATES = {}
+
+
+def get_crossing_debug_candidates():
+    """Return debug info about crossing candidates."""
+    return dict(_CROSSING_DEBUG_CANDIDATES)
+
+
+def set_walk_graph(walk_graph, synthetic_cfg=None, drive_graph=None):
+    """Set a dedicated walk graph and optionally add synthetic crossings."""
+    global _WALK_GRAPH, _SYNTHETIC_CROSSINGS
+    global _SYNTHETIC_CFG, _SYNTHETIC_TOTAL_ADDED, _SYNTHETIC_DRIVE_DONE
+    global _WALK_SPATIAL_INDEX, _WALK_SPATIAL_INDEX_META
+    global _WALK_TO_DRIVE_NODE_CACHE, _DRIVE_NODE_SIGNATURE_CACHE
+    global _DRIVE_NODE_SAFE_CACHE
+    global _DRIVE_NODE_FILTERED_SIG_CACHE
+    global _SYNTHETIC_DIAGNOSTICS
+    global _SYNTHETIC_REJECTED_UNSAFE
+    _WALK_GRAPH = walk_graph
+    _WALK_DIST_CACHE.clear()
+    _WALK_NODE_MAP_CACHE.clear()
+    _WALK_SPATIAL_INDEX = None
+    _WALK_SPATIAL_INDEX_META = None
+    _WALK_TO_DRIVE_NODE_CACHE = {}
+    _DRIVE_NODE_SIGNATURE_CACHE = {}
+    _DRIVE_NODE_SAFE_CACHE = {}
+    _DRIVE_NODE_FILTERED_SIG_CACHE = {}
+    _SYNTHETIC_CROSSINGS = []
+    _SYNTHETIC_REJECTED_UNSAFE = []
+    _SYNTHETIC_TOTAL_ADDED = 0
+    _SYNTHETIC_DRIVE_DONE = set()
+    _SYNTHETIC_DIAGNOSTICS = {
+        "strategy": "per_drive_node",
+        "checked_drive_nodes": 0,
+        "candidate_pairs_checked": 0,
+        "rejected_existing_edge": 0,
+        "rejected_distance": 0,
+        "rejected_lane_pair": 0,
+        "rejected_unsafe_road": 0,
+        "rejected_missing_cross_bearing": 0,
+        "rejected_not_perpendicular": 0,
+        "rejected_existing_walk_short": 0,
+        "added": 0,
+    }
+    cfg = synthetic_cfg or {}
+    _SYNTHETIC_CFG = dict(cfg)
+    strategy = str(cfg.get('strategy', 'per_drive_node')).lower()
+
+    if _WALK_GRAPH is not None and cfg.get("enabled") and strategy == 'batch':
+        _SYNTHETIC_CROSSINGS = build_synthetic_crossings(
+            _WALK_GRAPH,
+            min_dist_m=float(cfg.get("min_dist_m", 6.0)),
+            max_dist_m=float(cfg.get("max_dist_m", 20.0)),
+            max_per_node=int(cfg.get("max_per_node", 1)),
+            max_total=int(cfg.get("max_total", 2000)),
+            center_lat=cfg.get("center_lat"),
+            center_lon=cfg.get("center_lon"),
+            radius_km=cfg.get("radius_km"),
+            require_parallel_roads=bool(cfg.get("require_parallel_roads", False)),
+            max_parallel_delta_deg=float(cfg.get("max_parallel_delta_deg", 25.0)),
+            drive_graph=drive_graph,
+            require_same_highway=bool(cfg.get("require_same_highway", True)),
+            exclude_unsafe_roads=bool(cfg.get("exclude_unsafe_roads", True)),
+        )
+        _SYNTHETIC_TOTAL_ADDED = len(_SYNTHETIC_CROSSINGS)
+    elif _WALK_GRAPH is not None and cfg.get("enabled") and strategy == 'named_opposite_secondary_tertiary':
+        _SYNTHETIC_CROSSINGS = build_named_opposite_direction_crossings(
+            _WALK_GRAPH,
+            drive_graph=drive_graph,
+            min_dist_m=float(cfg.get("min_dist_m", 6.0)),
+            max_dist_m=float(cfg.get("max_dist_m", 20.0)),
+            min_opposite_bearing_deg=float(cfg.get("min_opposite_bearing_deg", 150.0)),
+            max_crossing_angle_delta_deg=float(cfg.get("max_crossing_angle_delta_deg", 30.0)),
+            min_spacing_m=float(cfg.get("min_spacing_m", 100.0)),
+            min_spacing_per_road_m=(
+                float(cfg["min_spacing_per_road_m"])
+                if cfg.get("min_spacing_per_road_m") is not None
+                else None
+            ),
+            max_per_road=(
+                int(cfg["max_per_road"])
+                if cfg.get("max_per_road") is not None
+                else None
+            ),
+            max_total=int(cfg.get("max_total", 2000)),
+            center_lat=cfg.get("center_lat"),
+            center_lon=cfg.get("center_lon"),
+            radius_km=cfg.get("radius_km"),
+            road_search_radius_m=float(cfg.get("road_search_radius_m", 60.0)),
+        )
+        _SYNTHETIC_TOTAL_ADDED = len(_SYNTHETIC_CROSSINGS)
+    elif _WALK_GRAPH is not None and cfg.get("enabled"):
+        _SYNTHETIC_DIAGNOSTICS["strategy"] = "per_drive_node"
+    return _SYNTHETIC_CROSSINGS
+
+
+def get_synthetic_crossings():
+    """Return the last synthetic crossings list."""
+    return list(_SYNTHETIC_CROSSINGS)
+
+
+def get_synthetic_diagnostics():
+    """Return counters that explain synthetic-crossing generation decisions."""
+    return dict(_SYNTHETIC_DIAGNOSTICS)
+
+
+def get_synthetic_rejected_unsafe():
+    """Return rejected synthetic candidates blocked due to unsafe-road filtering."""
+    return list(_SYNTHETIC_REJECTED_UNSAFE)
 
 
 def haversine_walk_distance(lat1, lon1, lat2, lon2):
@@ -61,16 +1377,21 @@ def walk_distance_on_roads(graph, node_a, node_b):
     """
     if node_a == node_b:
         return 0.0
-    cache_key = (node_a, node_b)
+    walk_g = _get_walk_graph(graph)
+    mapped_a = _map_to_walk_node(node_a, graph, walk_g, generate_synthetic=False)
+    # Generate synthetic links only around stop/candidate-stop side (node_b).
+    mapped_b = _map_to_walk_node(node_b, graph, walk_g, generate_synthetic=True)
+    if mapped_a is None or mapped_b is None:
+        return float('inf')
+    cache_key = (mapped_a, mapped_b, id(walk_g))
     if cache_key in _WALK_DIST_CACHE:
         return _WALK_DIST_CACHE[cache_key]
-    walk_g = _get_walk_graph(graph)
     try:
-        dist = nx.shortest_path_length(walk_g, node_a, node_b, weight='length')
+        dist = nx.shortest_path_length(walk_g, mapped_a, mapped_b, weight='length')
     except (nx.NetworkXNoPath, nx.NodeNotFound):
         dist = float('inf')
     _WALK_DIST_CACHE[cache_key] = dist
-    _WALK_DIST_CACHE[(node_b, node_a)] = dist  # Symmetric
+    _WALK_DIST_CACHE[(mapped_b, mapped_a, id(walk_g))] = dist  # Symmetric
     return dist
 
 
@@ -84,8 +1405,12 @@ def walk_path_on_roads(graph, node_a, node_b):
     if node_a == node_b:
         return [node_a]
     walk_g = _get_walk_graph(graph)
+    mapped_a = _map_to_walk_node(node_a, graph, walk_g, generate_synthetic=False)
+    mapped_b = _map_to_walk_node(node_b, graph, walk_g, generate_synthetic=True)
+    if mapped_a is None or mapped_b is None:
+        return []
     try:
-        return nx.shortest_path(walk_g, node_a, node_b, weight='length')
+        return nx.shortest_path(walk_g, mapped_a, mapped_b, weight='length')
     except (nx.NetworkXNoPath, nx.NodeNotFound):
         return []
 
