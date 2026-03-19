@@ -32,6 +32,12 @@ _SYNTHETIC_TOTAL_ADDED = 0
 _SYNTHETIC_DRIVE_DONE = set()
 _SYNTHETIC_DIAGNOSTICS = {}
 _SYNTHETIC_REJECTED_UNSAFE = []
+# Debug counters for synthetic crossing usage in BFS
+_CROSSING_BFS_STATS = {
+    "students_checked": 0,
+    "candidates_via_crossing": 0,  # drive nodes only reachable via synthetic crossing
+    "students_with_crossing_benefit": 0,  # students who got extra candidates via crossings
+}
 # Cache: (student_node, stop_node) -> walk_distance_meters
 _WALK_DIST_CACHE = {}
 # Cache: (walk_graph_id, drive_node_id) -> mapped_walk_node_id
@@ -1265,6 +1271,14 @@ def set_walk_graph(walk_graph, synthetic_cfg=None, drive_graph=None):
     _WALK_GRAPH = walk_graph
     _WALK_DIST_CACHE.clear()
     _WALK_NODE_MAP_CACHE.clear()
+    _safe_nodes_cache.clear()  # Clear BFS cache when walk graph changes
+    # Reset crossing BFS stats for fresh tracking
+    global _CROSSING_BFS_STATS
+    _CROSSING_BFS_STATS = {
+        "students_checked": 0,
+        "candidates_via_crossing": 0,
+        "students_with_crossing_benefit": 0,
+    }
     _WALK_SPATIAL_INDEX = None
     _WALK_SPATIAL_INDEX_META = None
     _WALK_TO_DRIVE_NODE_CACHE = {}
@@ -1422,7 +1436,7 @@ def get_walk_absolute_max(walk_radius):
     - HIGH (200m recommended): 500m absolute max
     """
     if walk_radius == 0:
-        return 150
+        return 500  # Door-to-door: allow finding nodes within 500m for isolated homes
     return min(walk_radius * 3, 500)
 
 
@@ -2094,13 +2108,21 @@ def _candidate_points(graph, node) -> int:
 _safe_nodes_cache = {}
 
 def find_safe_nodes_within_radius(coords, graph, radius_meters, walk_distance_limit,
-                                   candidate_cfg=None):
+                                   candidate_cfg=None, walk_graph=None):
     """Find all nodes reachable by walking within *walk_distance_limit* metres.
 
     Walking semantics
     -----------------
     The BFS is **bidirectional** (pedestrians ignore one-way rules) and only
     traverses edges where ``is_safe_to_cross`` is True.
+
+    When *walk_graph* is provided:
+    - BFS is performed on the walk graph (which may include synthetic crossings)
+    - Each reachable walk node is mapped to its nearest drive graph node
+    - Returns drive graph nodes suitable for bus stops
+
+    When *walk_graph* is None (legacy mode):
+    - BFS is performed directly on the drive graph
 
     The ``is_safe_to_cross`` flag is set per-edge by ``setup_graph``:
 
@@ -2128,7 +2150,9 @@ def find_safe_nodes_within_radius(coords, graph, radius_meters, walk_distance_li
     Returns a list of ``(node_id, distance_metres)`` tuples.
     """
     lat, lon = coords
-    cache_key = (lat, lon, walk_distance_limit)
+    # Include walk_graph identity in cache key to avoid stale results
+    walk_graph_id = id(walk_graph) if walk_graph is not None else 0
+    cache_key = (lat, lon, walk_distance_limit, walk_graph_id)
     if cache_key in _safe_nodes_cache:
         all_reachable = _safe_nodes_cache[cache_key]
         # Apply scoring/truncation on the cached full result if config given
@@ -2138,6 +2162,26 @@ def find_safe_nodes_within_radius(coords, graph, radius_meters, walk_distance_li
             )
         return all_reachable
 
+    # If walk_graph provided, do BFS on walk graph and map results to drive nodes
+    if walk_graph is not None:
+        safe_nodes = _bfs_walk_graph_to_drive_nodes(
+            coords, graph, walk_graph, walk_distance_limit
+        )
+    else:
+        # Legacy mode: BFS directly on drive graph
+        safe_nodes = _bfs_on_drive_graph(coords, graph, walk_distance_limit)
+
+    _safe_nodes_cache[cache_key] = safe_nodes
+
+    if candidate_cfg:
+        home_node = fast_nearest_node(graph, lon, lat)
+        return _rank_and_truncate_candidates(safe_nodes, graph, home_node, candidate_cfg)
+    return safe_nodes
+
+
+def _bfs_on_drive_graph(coords, graph, walk_distance_limit):
+    """BFS on drive graph - legacy behavior."""
+    lat, lon = coords
     start_node = fast_nearest_node(graph, lon, lat)
 
     safe_nodes = []
@@ -2181,11 +2225,157 @@ def find_safe_nodes_within_radius(coords, graph, radius_meters, walk_distance_li
                 if new_dist <= walk_distance_limit:
                     queue.append((predecessor, new_dist))
 
-    _safe_nodes_cache[cache_key] = safe_nodes
-
-    if candidate_cfg:
-        return _rank_and_truncate_candidates(safe_nodes, graph, start_node, candidate_cfg)
     return safe_nodes
+
+
+def _bfs_walk_graph_to_drive_nodes(coords, drive_graph, walk_graph, walk_distance_limit):
+    """BFS on walk graph, mapping reachable walk nodes to drive nodes.
+
+    This enables students to use synthetic crossings (on walk graph) to reach
+    bus stops (on drive graph) on the opposite side of dual carriageways.
+
+    Also tracks debug metrics about synthetic crossing usage.
+    """
+    global _CROSSING_BFS_STATS
+    lat, lon = coords
+
+    # Find starting walk node - map from nearest drive node
+    drive_start = fast_nearest_node(drive_graph, lon, lat)
+    walk_start = _map_to_walk_node(drive_start, drive_graph, walk_graph)
+    if walk_start is None:
+        # Fallback: direct snap to walk graph
+        walk_start = ox.nearest_nodes(walk_graph, lon, lat)
+
+    # BFS on walk graph
+    # Track: (walk_node, distance, crossed_synthetic)
+    visited = {}  # walk_node -> (dist, crossed_synthetic)
+    queue = [(walk_start, 0, False)]  # (node, distance, crossed_synthetic_to_get_here)
+
+    # Track minimum distance to each drive node and whether it required crossing
+    drive_node_min_dist = {}  # drive_node -> dist
+    drive_node_via_crossing = set()  # drive nodes reached ONLY via synthetic crossing
+    drive_node_without_crossing = set()  # drive nodes reachable without synthetic crossing
+
+    while queue:
+        current_walk_node, dist_so_far, crossed_synthetic = queue.pop(0)
+
+        if dist_so_far > walk_distance_limit:
+            continue
+
+        # Check if already visited with a better or equal path
+        if current_walk_node in visited:
+            prev_dist, prev_crossed = visited[current_walk_node]
+            # Skip if we've already found this node at same/shorter distance
+            if dist_so_far >= prev_dist:
+                continue
+        visited[current_walk_node] = (dist_so_far, crossed_synthetic)
+
+        # Map this walk node to a drive node (if not synthetic)
+        node_data = walk_graph.nodes.get(current_walk_node, {})
+        is_synthetic = node_data.get('synthetic', False) or (
+            isinstance(current_walk_node, str) and current_walk_node.startswith('synth_')
+        )
+
+        if not is_synthetic:
+            drive_node = _nearest_drive_node_for_walk_node(
+                current_walk_node, walk_graph, drive_graph
+            )
+            if drive_node is not None and drive_node in drive_graph:
+                # Keep minimum distance for each drive node
+                if drive_node not in drive_node_min_dist:
+                    drive_node_min_dist[drive_node] = dist_so_far
+                else:
+                    drive_node_min_dist[drive_node] = min(
+                        drive_node_min_dist[drive_node], dist_so_far
+                    )
+
+                # Track crossing usage for this drive node
+                if crossed_synthetic:
+                    drive_node_via_crossing.add(drive_node)
+                else:
+                    drive_node_without_crossing.add(drive_node)
+
+        # Helper to check if edge is synthetic crossing
+        def _is_synthetic_edge(edge_data_dict):
+            if isinstance(edge_data_dict, dict):
+                return edge_data_dict.get('synthetic_crossing', False)
+            for key, data in edge_data_dict.items():
+                if data.get('synthetic_crossing', False):
+                    return True
+            return False
+
+        # Walk along edges (bidirectional for pedestrians)
+        # Handle both directed and undirected graphs
+        is_directed = walk_graph.is_directed()
+        neighbors_iter = walk_graph.successors(current_walk_node) if is_directed else walk_graph.neighbors(current_walk_node)
+        for neighbor in neighbors_iter:
+            edge_data = walk_graph[current_walk_node][neighbor]
+            is_safe = False
+            edge_length = float('inf')
+            is_crossing_edge = _is_synthetic_edge(edge_data)
+
+            if isinstance(edge_data, dict) and 'length' in edge_data:
+                is_safe = edge_data.get('is_safe_to_cross', True)
+                edge_length = edge_data.get('length', 0)
+            else:
+                for key, data in edge_data.items():
+                    if data.get('is_safe_to_cross', True):
+                        is_safe = True
+                        edge_length = min(edge_length, data.get('length', 0))
+            if is_safe:
+                new_dist = dist_so_far + edge_length
+                if new_dist <= walk_distance_limit:
+                    new_crossed = crossed_synthetic or is_crossing_edge
+                    queue.append((neighbor, new_dist, new_crossed))
+
+        # Also check predecessors (for directed graphs only)
+        if is_directed:
+            for predecessor in walk_graph.predecessors(current_walk_node):
+                edge_data = walk_graph[predecessor][current_walk_node]
+                is_safe = False
+                edge_length = float('inf')
+                is_crossing_edge = _is_synthetic_edge(edge_data)
+
+                if isinstance(edge_data, dict) and 'length' in edge_data:
+                    is_safe = edge_data.get('is_safe_to_cross', True)
+                    edge_length = edge_data.get('length', 0)
+                else:
+                    for key, data in edge_data.items():
+                        if data.get('is_safe_to_cross', True):
+                            is_safe = True
+                            edge_length = min(edge_length, data.get('length', 0))
+                if is_safe:
+                    new_dist = dist_so_far + edge_length
+                    if new_dist <= walk_distance_limit:
+                        new_crossed = crossed_synthetic or is_crossing_edge
+                        queue.append((predecessor, new_dist, new_crossed))
+
+    # Calculate crossing-only candidates (nodes reachable ONLY via crossing)
+    crossing_only_nodes = drive_node_via_crossing - drive_node_without_crossing
+
+    # Update global stats
+    _CROSSING_BFS_STATS["students_checked"] += 1
+    _CROSSING_BFS_STATS["candidates_via_crossing"] += len(crossing_only_nodes)
+    if crossing_only_nodes:
+        _CROSSING_BFS_STATS["students_with_crossing_benefit"] += 1
+
+    # Convert to list of (node, dist) tuples
+    return [(node, dist) for node, dist in drive_node_min_dist.items()]
+
+
+def get_crossing_bfs_stats():
+    """Return debug statistics about synthetic crossing usage in BFS."""
+    return dict(_CROSSING_BFS_STATS)
+
+
+def reset_crossing_bfs_stats():
+    """Reset the crossing BFS statistics."""
+    global _CROSSING_BFS_STATS
+    _CROSSING_BFS_STATS = {
+        "students_checked": 0,
+        "candidates_via_crossing": 0,
+        "students_with_crossing_benefit": 0,
+    }
 
 
 def _rank_and_truncate_candidates(all_nodes, graph, home_node, candidate_cfg):
@@ -2202,6 +2392,190 @@ def _rank_and_truncate_candidates(all_nodes, graph, home_node, candidate_cfg):
 
     result = home + others
     return result[:max_k]
+
+
+def _extract_synthetic_crossings_from_path(walk_graph, walk_path):
+    """Extract synthetic crossing edges from a walk path.
+
+    Args:
+        walk_graph: Walk graph with synthetic crossing edges marked
+        walk_path: List of node IDs from walk_path_on_roads (may be empty or single node)
+
+    Returns:
+        List of synthetic crossing edge tuples: [(u, v), ...] normalized as (min, max)
+    """
+    if not walk_path or len(walk_path) < 2:
+        return []
+
+    crossings = []
+    for i in range(len(walk_path) - 1):
+        u, v = walk_path[i], walk_path[i + 1]
+
+        # Get edge data (handle both directed and undirected, multigraph keys)
+        edge_data = walk_graph.get_edge_data(u, v)
+        if edge_data is None:
+            edge_data = walk_graph.get_edge_data(v, u)
+
+        if edge_data is None:
+            continue
+
+        # Check if any key in this edge is synthetic
+        is_synthetic = False
+        if isinstance(edge_data, dict) and 'synthetic_crossing' in edge_data:
+            is_synthetic = edge_data.get('synthetic_crossing', False)
+        else:
+            # MultiGraph: check all keys
+            for key, data in edge_data.items() if isinstance(edge_data, dict) else []:
+                if data.get('synthetic_crossing', False):
+                    is_synthetic = True
+                    break
+
+        if is_synthetic:
+            # Normalize edge as (min, max) to handle direction independence
+            crossing_key = (min(u, v), max(u, v))
+            if crossing_key not in crossings:
+                crossings.append(crossing_key)
+
+    return crossings
+
+
+def get_crossing_usage_from_solution(solution, drive_graph, walk_graph):
+    """Extract which synthetic crossings were actually used by students' walk paths.
+
+    Args:
+        solution: ServiceSolution object with routes and stops
+        drive_graph: Drive graph (for path finding)
+        walk_graph: Walk graph with synthetic crossings
+
+    Returns:
+        Dict: {crossing_key: {
+            "students": [student_ids],
+            "homes": [(lat, lon), ...],
+            "count": n,
+            "length_m": distance
+        }, ...}
+    """
+    crossing_usage = {}  # (u, v) -> {students, homes, count}
+
+    if not solution or not solution.routes:
+        return crossing_usage
+
+    for route in solution.routes:
+        for stop in route.stops:
+            # Skip school stops
+            if getattr(stop, 'stop_type', None) == 'school':
+                continue
+
+            for student in getattr(stop, 'students', []):
+                # Get student home node (map from coordinates)
+                try:
+                    student_home_node = ox.nearest_nodes(drive_graph, student.coords[1], student.coords[0])
+                except Exception:
+                    continue
+
+                # Get walk path from home to stop
+                try:
+                    walk_path = walk_path_on_roads(drive_graph, student_home_node, stop.node_id)
+                except Exception:
+                    walk_path = []
+
+                # Extract synthetic crossings used in this path
+                crossings = _extract_synthetic_crossings_from_path(walk_graph, walk_path)
+
+                for crossing_key in crossings:
+                    if crossing_key not in crossing_usage:
+                        crossing_usage[crossing_key] = {
+                            "students": [],
+                            "homes": [],
+                        }
+
+                    crossing_usage[crossing_key]["students"].append(student.id)
+                    crossing_usage[crossing_key]["homes"].append((student.coords[0], student.coords[1]))
+
+    # Deduplicate and add counts
+    for crossing_key, data in crossing_usage.items():
+        data["students"] = list(set(data["students"]))
+        data["homes"] = list(set(data["homes"]))
+        data["count"] = len(data["students"])
+
+    return crossing_usage
+
+
+def _get_crossing_geometry_and_midpoint(walk_graph, u, v):
+    """Extract geometry and calculate midpoint for a crossing edge.
+
+    Args:
+        walk_graph: Walk graph containing the edge
+        u, v: Edge nodes
+
+    Returns:
+        Dict with keys: "coords" (list of lat/lon), "lat", "lon", "length_m"
+    """
+    coords = []
+    length_m = 0.0
+
+    # Get edge data
+    edge_data = walk_graph.get_edge_data(u, v)
+    if edge_data is None:
+        edge_data = walk_graph.get_edge_data(v, u)
+
+    if edge_data is None:
+        # Fallback: just use node coordinates
+        try:
+            lat_u, lon_u = walk_graph.nodes[u]['y'], walk_graph.nodes[u]['x']
+            lat_v, lon_v = walk_graph.nodes[v]['y'], walk_graph.nodes[v]['x']
+            coords = [(lat_u, lon_u), (lat_v, lon_v)]
+            length_m = math.sqrt((lat_v - lat_u)**2 + (lon_v - lon_u)**2) * 111000  # rough meters conversion
+        except Exception:
+            pass
+    else:
+        # Extract geometry from edge
+        if isinstance(edge_data, dict) and 'geometry' in edge_data:
+            # Simple edge with geometry
+            try:
+                geom = edge_data.get('geometry')
+                if geom:
+                    coords = [(lat, lon) for lon, lat in geom.coords]
+                length_m = edge_data.get('length', 0.0)
+            except Exception:
+                pass
+        else:
+            # MultiGraph: find best edge with geometry
+            for key, data in edge_data.items() if isinstance(edge_data, dict) else []:
+                if 'geometry' in data:
+                    try:
+                        geom = data.get('geometry')
+                        if geom:
+                            coords = [(lat, lon) for lon, lat in geom.coords]
+                        length_m = data.get('length', 0.0)
+                        break
+                    except Exception:
+                        pass
+
+        # Fallback if no geometry found
+        if not coords:
+            try:
+                lat_u, lon_u = walk_graph.nodes[u]['y'], walk_graph.nodes[u]['x']
+                lat_v, lon_v = walk_graph.nodes[v]['y'], walk_graph.nodes[v]['x']
+                coords = [(lat_u, lon_u), (lat_v, lon_v)]
+                if not length_m:
+                    length_m = math.sqrt((lat_v - lat_u)**2 + (lon_v - lon_u)**2) * 111000
+            except Exception:
+                pass
+
+    # Calculate midpoint
+    if coords:
+        lat_mid = sum(c[0] for c in coords) / len(coords)
+        lon_mid = sum(c[1] for c in coords) / len(coords)
+    else:
+        lat_mid = lon_mid = 0.0
+
+    return {
+        "coords": coords,
+        "lat": lat_mid,
+        "lon": lon_mid,
+        "length_m": round(length_m, 1),
+    }
 
 
 # ============================================================================
@@ -2460,8 +2834,9 @@ def calculate_afternoon_ride_time_potential(route, new_stop, insert_position, gr
                 continue
             
             # Check 2: Path from student to stop is safe (details in find_safe_nodes_within_radius)
+            walk_g = _get_walk_graph(graph)  # Use walk graph with crossings if available
             safe_nodes = find_safe_nodes_within_radius(
-                student.coords, graph, 500, student.walk_radius
+                student.coords, graph, 500, student.walk_radius, walk_graph=walk_g
             )
             safe_node_ids = [n[0] for n in safe_nodes]
             
@@ -2888,7 +3263,8 @@ def cheapest_insertion(new_student, existing_routes, graph, detour_type='tempora
     
     # 2. Find other candidate nodes within walking distance (only if walk_limit > 0)
     if walk_limit > 0:
-        safe_nodes = find_safe_nodes_within_radius(new_student.coords, graph, 500, walk_limit)
+        walk_g = _get_walk_graph(graph)  # Use walk graph with crossings if available
+        safe_nodes = find_safe_nodes_within_radius(new_student.coords, graph, 500, walk_limit, walk_graph=walk_g)
         for node_id, dist in sorted(safe_nodes, key=lambda x: x[1]):
             if node_id not in candidate_node_ids:
                 candidate_node_ids.append(node_id)

@@ -234,12 +234,13 @@ def _get_insertions_for_route(student, route, graph, frontage_info):
         dist_map = {frontage_node_id: 0.0}  # node_id -> walk distance (metres)
         
         if student.walk_radius > 0:
-            from detour_engine import find_safe_nodes_within_radius
+            from detour_engine import find_safe_nodes_within_radius, _get_walk_graph
             # Pass candidate_cfg so results are scored (intersections/arterials preferred)
             # and already returned in (-points, dist) order.
             cand_cfg = _alns_candidate_cfg if _alns_candidate_cfg else None
+            walk_g = _get_walk_graph(graph)  # Use walk graph with crossings if available
             safe_nodes = find_safe_nodes_within_radius(
-                student.coords, graph, 500, student.walk_radius, candidate_cfg=cand_cfg
+                student.coords, graph, 500, student.walk_radius, candidate_cfg=cand_cfg, walk_graph=walk_g
             )
             for node_id, dist in safe_nodes:  # already sorted by scoring function
                 if node_id != frontage_node_id:

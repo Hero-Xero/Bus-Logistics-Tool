@@ -95,16 +95,119 @@ def _dir_cap_html(label, ride, direct, cap, k):
     )
 
 
-def create_route_map(G, routes, students_to_routes=None, all_students=None, school_coords=None, output_file='route_map.html'):
+def _add_crossing_usage_markers(feature_group, solution, drive_graph):
+    """Add synthetic crossing usage markers to a feature group.
+
+    Args:
+        feature_group: Folium FeatureGroup to add markers to
+        solution: ServiceSolution object
+        drive_graph: Drive graph for path extraction
+    """
+    from detour_engine import (
+        get_crossing_usage_from_solution,
+        _get_crossing_geometry_and_midpoint,
+        _get_walk_graph,
+    )
+
+    # Get walk graph (with synthetic crossings)
+    try:
+        walk_graph = _get_walk_graph(drive_graph)
+    except Exception as e:
+        print(f"Warning: Could not get walk graph for crossing visualization: {e}")
+        return
+
+    # Get crossing usage data
+    try:
+        crossing_usage = get_crossing_usage_from_solution(solution, drive_graph, walk_graph)
+    except Exception as e:
+        print(f"Warning: Could not extract crossing usage: {e}")
+        return
+
+    if not crossing_usage:
+        print("No crossing usage found in solution")
+        return
+
+    # Draw each crossing
+    for (u, v), usage_data in crossing_usage.items():
+        try:
+            # Get crossing geometry and midpoint
+            geom_data = _get_crossing_geometry_and_midpoint(walk_graph, u, v)
+
+            if not geom_data.get("coords"):
+                continue
+
+            # Draw white halo
+            folium.PolyLine(
+                locations=geom_data["coords"],
+                color="#ffffff",
+                weight=8,
+                opacity=0.85,
+                popup=None,
+                tooltip=None
+            ).add_to(feature_group)
+
+            # Draw magenta core
+            folium.PolyLine(
+                locations=geom_data["coords"],
+                color="#c2185b",
+                weight=5,
+                opacity=0.95,
+                popup=None,
+                tooltip=None
+            ).add_to(feature_group)
+
+            # Build popup HTML
+            student_ids_str = ", ".join(usage_data.get("students", [])[:10])
+            if len(usage_data.get("students", [])) > 10:
+                student_ids_str += f", ... +{len(usage_data['students']) - 10} more"
+
+            home_count = len(usage_data.get("homes", []))
+            popup_html = f"""
+            <div style="width: 300px; font-size: 12px;">
+                <b>Synthetic Crossing</b><br>
+                <hr style="margin: 5px 0;">
+                <b>Length:</b> {geom_data.get('length_m', 0):.1f} m<br>
+                <b>Location:</b> {geom_data.get('lat', 0):.5f}, {geom_data.get('lon', 0):.5f}<br>
+                <hr style="margin: 5px 0;">
+                <b>Students using crossing:</b> {student_ids_str}<br>
+                <b>Number of students:</b> {usage_data.get('count', 0)}<br>
+                <b>Number of homes:</b> {home_count}<br>
+                <hr style="margin: 5px 0;">
+                <b>Impact:</b> {usage_data.get('count', 0)} student(s) can reach stops on opposite side of dual carriageway
+            </div>
+            """
+
+            # Add marker at midpoint
+            folium.CircleMarker(
+                location=(geom_data.get("lat", 0), geom_data.get("lon", 0)),
+                radius=8,
+                color="#4a148c",
+                fill=True,
+                fillColor="#ffeb3b",
+                fillOpacity=0.95,
+                weight=2,
+                popup=folium.Popup(popup_html, max_width=400),
+                tooltip=f"Crossing ({geom_data.get('length_m', 0):.0f}m) - {usage_data.get('count', 0)} students from {home_count} homes"
+            ).add_to(feature_group)
+
+        except Exception as e:
+            print(f"Warning: Could not render crossing ({u}, {v}): {e}")
+            continue
+
+
+def create_route_map(G, routes, students_to_routes=None, all_students=None, school_coords=None, output_file='route_map.html', solution=None, show_crossing_usage=True):
     """Create a comprehensive map showing routes, stops, and students.
-    
+
     Args:
         G: NetworkX road network graph with 'travel_time' and 'is_safe_to_cross' attributes
         routes: List of Route objects
         students_to_routes: Dict mapping student id to route (for finding assignments)
         all_students: List of all Student objects (to identify unserved ones)
+        school_coords: Dict with school location coordinates
         output_file: Output HTML file name
-        
+        solution: Optional ServiceSolution object for crossing usage visualization
+        show_crossing_usage: Whether to show synthetic crossing usage overlay (requires solution)
+
     Returns:
         Folium Map object
     """
@@ -469,7 +572,18 @@ def create_route_map(G, routes, students_to_routes=None, all_students=None, scho
                         opacity=0.4,
                         dash_array='8, 6'
                     ).add_to(m)
-    
+
+    # Add synthetic crossing usage visualization
+    if solution and show_crossing_usage:
+        crossing_fg = folium.FeatureGroup(name="Synthetic Crossing Usage", show=True)
+        _add_crossing_usage_markers(crossing_fg, solution, G)
+        crossing_fg.add_to(m)
+
+        # Enable LayerControl if not already present
+        if not hasattr(m, '_has_layer_control'):
+            folium.LayerControl().add_to(m)
+            m._has_layer_control = True
+
     # Add unserved students (failed assignments)
     if all_students:
         for student in all_students:

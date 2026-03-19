@@ -25,7 +25,7 @@ from detour_engine import (
     calculate_route_distance, calculate_route_time,
     cheapest_insertion, process_detour_request, insert_with_2opt,
     snap_address_to_edge, precalculate_distance_matrix,
-    find_safe_nodes_within_radius, find_shortest_path_with_turns,
+    find_safe_nodes_within_radius, find_shortest_path_with_turns, _get_walk_graph,
     get_walk_absolute_max, haversine_walk_distance,
     _MATRIX_CACHE, _MATRIX_CACHE_LENGTH, _path_cache
 )
@@ -240,7 +240,8 @@ def precompute_matrix(students, routes, G, fast_mode=None, G_drive=None,
         critical_nodes.add(node_id)
         student_frontages[s.id] = node_id
         if s.walk_radius > 0:
-            safe_nodes = find_safe_nodes_within_radius(s.coords, G, 500, s.walk_radius)
+            walk_g = _get_walk_graph(G)  # Use walk graph with crossings if available
+            safe_nodes = find_safe_nodes_within_radius(s.coords, G, 500, s.walk_radius, walk_graph=walk_g)
             for safe_node_id, _ in safe_nodes[:max_candidates]:
                 critical_nodes.add(safe_node_id)
     school_node = None
@@ -288,7 +289,8 @@ def run_generate_routes(data, G, input_file_path):
     routes_with_students = [r for r in best_sol.routes if r.get_student_count() > 0]
     if routes_with_students:
         create_route_map(G, routes_with_students, all_students=best_sol.students,
-                         school_coords=school_coords, output_file='route_map.html')
+                         school_coords=school_coords, output_file='route_map.html',
+                         solution=best_sol, show_crossing_usage=True)
     unserved = [s for s in best_sol.students if not s.is_served]
     output = serialize_routes(best_sol.routes, buses, school_coords, unserved, G)
     output["meta"] = {
@@ -599,7 +601,8 @@ def run_change_location(data, G, input_file_path):
     if os.path.exists('route_map.html'): shutil.copy2('route_map.html', 'route_map_old.html')
     if success:
         create_route_map(G, [r for r in routes if r.get_student_count() > 0], all_students=all_students,
-                         school_coords=school_coords, output_file='route_map_new.html')
+                         school_coords=school_coords, output_file='route_map_new.html',
+                         solution=None, show_crossing_usage=False)
     unserved = [s for s in all_students if not s.is_served]
     output = serialize_routes(routes, buses, school_coords, unserved, G)
     if not success: output = {"status": "failed", "student_id": student_id, "reason": message}

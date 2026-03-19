@@ -10,7 +10,7 @@ exact input used are saved together in the subfolder.
 Usage
 -----
     python experiments/experiment4_crossings/run.py
-    python experiments/experiment4_crossings/run.py --input path/to/input.json
+    python experiments/experiment4_crossings/run.py --input experiments/experiment4_crossings/input.json
 """
 
 import argparse
@@ -46,6 +46,15 @@ def _input_hash(input_path: str) -> str:
     return hashlib.md5(canonical.encode()).hexdigest()[:8]
 
 
+def _get_crossings_status(input_path: str) -> str:
+    """Return 'crossings_enabled' or 'crossings_disabled' based on input config."""
+    with open(input_path, encoding="utf-8") as f:
+        raw = json.load(f)
+    synth_cfg = raw.get("synthetic_crossings", {})
+    enabled = synth_cfg.get("enabled", False)
+    return "crossings_enabled" if enabled else "crossings_disabled"
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Experiment 4 – Crossings",
@@ -64,7 +73,8 @@ def main():
         sys.exit(f"[ERROR] config file not found: {input_path}")
 
     h = _input_hash(input_path)
-    run_dir = os.path.join(_DIR, h)
+    crossings_status = _get_crossings_status(input_path)
+    run_dir = os.path.join(_DIR, f"{h}_{crossings_status}")
     os.makedirs(run_dir, exist_ok=True)
 
     dest_input = os.path.join(run_dir, "input.json")
@@ -75,6 +85,7 @@ def main():
 
     print("Experiment 4 – Crossings")
     print(f"  Config hash  : {h}")
+    print(f"  Crossings    : {crossings_status.replace('_', ' ')}")
     print(f"  Run folder   : {run_dir}")
     print(f"  Input config : {input_path}")
     print(f"  Output map   : {output_path}")

@@ -20,7 +20,7 @@ Usage (from the repo root):
     python -m experiments.comparison.run_comparison --iterations 50
 """
 
-import os, sys, json, time, copy, math, argparse, datetime, statistics
+import os, sys, json, time, copy, math, argparse, datetime, statistics, random
 
 # ── path fix: ensure repo root is on sys.path ──
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -365,6 +365,8 @@ from detour_engine import (
     find_shortest_path_with_turns,
     get_bearing_of_path,
     _candidate_points as _cand_pts,
+    get_crossing_bfs_stats,
+    reset_crossing_bfs_stats,
 )
 
 # Arrow text template — spaces pad between arrow glyphs
@@ -1050,7 +1052,7 @@ def _collect_used_synthetic_edge_keys(solutions, graph_for_walk):
                         data = ed[0] if 0 in ed else list(ed.values())[0]
                         if not data.get("synthetic_crossing", False):
                             continue
-                        used.add((a, b) if a < b else (b, a))
+                        used.add((a, b) if str(a) < str(b) else (b, a))
     return used
 
 
@@ -1072,7 +1074,7 @@ def _add_synthetic_crossing_markers(m, crossings_list, show_only_used=False, use
         for u, v, k, data in walk_g.edges(keys=True, data=True):
             if not data.get("synthetic_crossing", False):
                 continue
-            edge_key = (u, v) if u < v else (v, u)
+            edge_key = (u, v) if str(u) < str(v) else (v, u)
             if show_only_used and edge_key not in used_edge_keys:
                 continue
             if "geometry" in data:
@@ -1114,6 +1116,105 @@ def _add_synthetic_crossing_markers(m, crossings_list, show_only_used=False, use
     return fg
 
 
+def _add_crossing_usage_layers(m, solutions_dict, G_walk, G_drive):
+    """Add crossing usage visualization layers for each mode.
+
+    For each mode (A, B, C), creates a FeatureGroup showing which synthetic
+    crossings were actually used by students' walk paths.
+
+    Args:
+        m: Folium map object
+        solutions_dict: Dict with keys A, B, C mapping to ServiceSolution objects
+        G_walk: Walk graph with synthetic crossings
+        G_drive: Drive graph for path finding
+
+    Returns:
+        Dict mapping mode key to FeatureGroup with crossing usage markers
+    """
+    from detour_engine import (
+        get_crossing_usage_from_solution,
+        _get_crossing_geometry_and_midpoint,
+    )
+
+    fgs_usage = {}
+    mode_colors = {"A": "#1f77b4", "B": "#ff7f0e", "C": "#2ca02c"}  # Blue, Orange, Green
+
+    for mode_key, solution in solutions_dict.items():
+        if solution is None:
+            continue
+
+        try:
+            # Get crossing usage for this mode's solution
+            crossing_usage = get_crossing_usage_from_solution(solution, G_drive, G_walk)
+
+            if not crossing_usage:
+                continue
+
+            mode_label = {"A": "Constrained", "B": "Unconstrained", "C": "Door-to-Door"}.get(mode_key, mode_key)
+            fg = FeatureGroup(name=f"Crossing Usage – Mode {mode_key} ({len(crossing_usage)})", show=False)
+
+            for (u, v), usage_data in crossing_usage.items():
+                try:
+                    geom_data = _get_crossing_geometry_and_midpoint(G_walk, u, v)
+                    if not geom_data.get("coords"):
+                        continue
+
+                    # Draw halo and core
+                    folium.PolyLine(
+                        locations=geom_data["coords"],
+                        color="#ffffff", weight=8, opacity=0.85
+                    ).add_to(fg)
+                    folium.PolyLine(
+                        locations=geom_data["coords"],
+                        color=mode_colors[mode_key], weight=5, opacity=0.95
+                    ).add_to(fg)
+
+                    # Build popup
+                    student_ids_str = ", ".join(usage_data.get("students", [])[:10])
+                    if len(usage_data.get("students", [])) > 10:
+                        student_ids_str += f", ... +{len(usage_data['students']) - 10} more"
+
+                    home_count = len(usage_data.get("homes", []))
+                    popup_html = f"""
+                    <div style="width: 300px; font-size: 11px;">
+                        <b>Crossing in Mode {mode_key} ({mode_label})</b><br>
+                        <hr style="margin: 3px 0;">
+                        <b>Length:</b> {geom_data.get('length_m', 0):.1f} m<br>
+                        <b>Location:</b> {geom_data.get('lat', 0):.5f}, {geom_data.get('lon', 0):.5f}<br>
+                        <hr style="margin: 3px 0;">
+                        <b>Students:</b> {student_ids_str}<br>
+                        <b>Count:</b> {usage_data.get('count', 0)} students from {home_count} homes<br>
+                        <b>Impact:</b> These students can reach stops on opposite side of dual carriageway
+                    </div>
+                    """
+
+                    folium.CircleMarker(
+                        location=(geom_data.get("lat", 0), geom_data.get("lon", 0)),
+                        radius=7,
+                        color=mode_colors[mode_key],
+                        fill=True,
+                        fillColor="#ffeb3b",
+                        fillOpacity=0.85,
+                        weight=2,
+                        popup=folium.Popup(popup_html, max_width=400),
+                        tooltip=f"Mode {mode_key}: {usage_data.get('count', 0)} students use this crossing"
+                    ).add_to(fg)
+
+                except Exception as e:
+                    print(f"  Warning: Could not render crossing in Mode {mode_key}: {e}")
+                    continue
+
+            fg.add_to(m)
+            fgs_usage[mode_key] = fg
+            print(f"  Crossing usage – Mode {mode_key}: {len(crossing_usage)} crossings with student usage")
+
+        except Exception as e:
+            print(f"  Warning: Could not extract crossing usage for Mode {mode_key}: {e}")
+            continue
+
+    return fgs_usage
+
+
 def _build_custom_layer_control_js(
     map_var, fg_danger, fg_unclass, fg_walknet, fg_syn_cross,
     fgs_a, fgs_b, fgs_c,
@@ -1121,6 +1222,7 @@ def _build_custom_layer_control_js(
     syn_label=None,
     fg_unserved_a=None, fg_unserved_b=None, fg_unserved_c=None,
     fg_cands_a=None,   fg_cands_b=None,   fg_cands_c=None,
+    fg_usage_a=None,   fg_usage_b=None,   fg_usage_c=None,
 ):
     """Return JS that adds a titled, grouped layer-control widget to the map.
 
@@ -1169,6 +1271,19 @@ def _build_custom_layer_control_js(
                 row('{label}',
                     [{vca}],
                     map.hasLayer({vca}));"""
+
+    usage_rows = ""
+    for fg_u, label in [
+        (fg_usage_a, 'Constrained – Crossing Usage'),
+        (fg_usage_b, 'Unconstrained – Crossing Usage'),
+        (fg_usage_c, 'Door-to-Door – Crossing Usage'),
+    ]:
+        if fg_u is not None:
+            vu = fg_u.get_name()
+            usage_rows += f"""
+                row('{label}',
+                    [{vu}],
+                    map.hasLayer({vu}));"""
 
     return f"""
     window.addEventListener('load', function() {{
@@ -1229,7 +1344,7 @@ def _build_custom_layer_control_js(
                 row('Safe Walking Network (cyan streets)',
                     [{v_walknet}], map.hasLayer({v_walknet}));
                 row('{syn_label}',
-                    [{v_syn}], map.hasLayer({v_syn}));{crossings_row}{unserved_rows}
+                    [{v_syn}], map.hasLayer({v_syn}));{crossings_row}{usage_rows}{unserved_rows}
                 sep();
                 var hdr2 = L.DomUtil.create('div', '', c);
                 hdr2.textContent = 'Candidate Stop Inspector';
@@ -1254,8 +1369,10 @@ def _build_stats_html(all_stats, crossings_dict, occupancies_dict,
 
     algo = (meta or {}).get("algorithm", {}) if meta else {}
     buses_cfg = (meta or {}).get("buses", {}) if meta else {}
+    synth_cfg = (meta or {}).get("synthetic_crossings", {}) if meta else {}
     caps_on = (constraints or {}).get("enabled", True)
     soft_caps = (constraints or {}).get("soft_ride_caps", False)
+    crossings_enabled = bool(synth_cfg.get("enabled", False))
     time_budget = algo.get("time_budget_seconds", None)
     max_cands = algo.get("max_candidates_per_student", None)
     buses_count = buses_cfg.get("count", None)
@@ -1342,7 +1459,7 @@ def _build_stats_html(all_stats, crossings_dict, occupancies_dict,
             <tr style="color:#555;">
               <td style="text-align:left; padding:1px 4px;">Routes</td>
               <td style="text-align:left; padding:1px 4px;">Fleet</td>
-              <td style="text-align:left; padding:1px 4px;">Total Time</td>
+              <td style="text-align:left; padding:1px 4px;">Time (Bus+Walk)</td>
               <td style="text-align:left; padding:1px 4px;">Distance</td>
               <td style="text-align:left; padding:1px 4px;">Avg Occ.</td>
               <td style="text-align:left; padding:1px 4px;">Served</td>
@@ -1352,7 +1469,7 @@ def _build_stats_html(all_stats, crossings_dict, occupancies_dict,
             <tr style="font-weight:bold;">
               <td style="padding:1px 4px;">{s['routes']}</td>
               <td style="padding:1px 4px;">{fleet_cell}</td>
-              <td style="padding:1px 4px;">{s['total_time']:.0f} min</td>
+              <td style="padding:1px 4px;">{s['total_time']:.0f}+{s.get('walk_stats', {}).get('avg_walk_time_min', 0) * s['served']:.0f} min</td>
               <td style="padding:1px 4px;">{s['total_dist']:.1f} km</td>
               <td style="padding:1px 4px;">{avg_occ_str}</td>
               <td style="padding:1px 4px;">{s['served']}/{s['total']}</td>
@@ -1422,6 +1539,7 @@ def _build_stats_html(all_stats, crossings_dict, occupancies_dict,
     algo_lines.append(f"Caps: {'ON' if caps_on else 'OFF'}")
     algo_lines.append(f"SoftCaps: {'ON' if soft_caps else 'OFF'}")
     algo_lines.append(f"MinFleet: {'ON' if minimize_buses else 'OFF'}")
+    algo_lines.append(f"Crossings: {'ON' if crossings_enabled else 'OFF'}")
     cap_penalty = (constraints or {}).get("cap_penalty_per_minute", None)
     if cap_penalty is not None:
         algo_lines.append(f"CapPenalty: {cap_penalty}/min")
@@ -1609,6 +1727,18 @@ def _build_metrics(meta, stage_walk, all_stats, crossings_dict,
             "ride_cap_checked_pm":    s.get("cap_checked_pm"),
             "ride_cap_violation_pct_pm": s.get("cap_violation_pct_pm"),
         }
+
+        # Calculate total walking time across all students
+        if walk and "avg_walk_time_min" in walk:
+            total_students = s["served"]
+            total_walk_time = walk["avg_walk_time_min"] * total_students
+            total_time_with_walks = s["total_time"] + total_walk_time
+            mode_entry["total_walk_time_min"] = round(total_walk_time, 2)
+            mode_entry["total_time_with_walks_min"] = round(total_time_with_walks, 2)
+        else:
+            mode_entry["total_walk_time_min"] = 0
+            mode_entry["total_time_with_walks_min"] = round(s["total_time"], 2)
+
         # Attach fleet-search diagnostics if present
         if s.get("fleet_search_log"):
             mode_entry["fleet_search"] = {
@@ -1784,6 +1914,13 @@ def run(input_path=None, output_path=None, iterations=None):
         print(f"  Skipping : {', '.join(_mode_labels[m] for m in _skipped)} (debug flags)")
     print()
 
+    # Seed random for reproducible ALNS runs
+    seed_val = meta.get('seed', 42)
+    random.seed(seed_val)
+    import numpy as np
+    np.random.seed(seed_val)
+    print(f"  Random seed: {seed_val} (ALNS deterministic)")
+
     # ── 1. Generate dataset ──
     print("[1/7] Generating dataset …")
     _t0 = _wtime.time()
@@ -1843,15 +1980,26 @@ def run(input_path=None, output_path=None, iterations=None):
         synth_cfg["center_lat"] = school_cfg["latitude"]
         synth_cfg["center_lon"] = school_cfg["longitude"]
         synth_cfg.setdefault("radius_km", walk_radius_km)
+        # Save clean walk graph BEFORE crossings are added (set_walk_graph modifies in-place)
+        import copy as _copy_mod
+        _clean_walk_graph = _copy_mod.deepcopy(G_walk)
         syn_list = _eng.set_walk_graph(G_walk, synthetic_cfg=synth_cfg, drive_graph=G_con)
         _step_times["build_walk_graph_s"] = round(_wtime.time() - _t0, 2)
     else:
         print("[3b/7] Walking graph disabled (meta.walk_graph.enabled=false)")
         _eng.set_walk_graph(None, synthetic_cfg={"enabled": False})
+        _clean_walk_graph = None
 
     # ── 4. Mode A: Constrained ──
     # Walking BFS uses G_con (safety-restricted edges).
     # Bus driving distances ALWAYS use G_unc (full road network).
+    # NOTE: For Mode A, we use the walk graph WITHOUT synthetic crossings.
+    # Crossings let pedestrians cross secondary/trunk roads which defeats the
+    # safety constraint.
+    _saved_walk_graph = _eng._WALK_GRAPH
+    if _clean_walk_graph is not None and use_walk_graph:
+        _eng._WALK_GRAPH = _clean_walk_graph
+        print("  [Mode A] Using walk graph WITHOUT synthetic crossings")
     _ride_caps_on = meta.get("constraints", {}).get("enabled", True)
     _t_a = _wtime.time()
     print("\n" + "-" * 50)
@@ -1898,6 +2046,10 @@ def run(input_path=None, output_path=None, iterations=None):
           f"{stats_a['runtime']:.1f}s")
 
     # ── 5. Mode B: Unconstrained ──
+    # Restore walk graph with crossings for Mode B - crossings help in unconstrained mode
+    if _saved_walk_graph is not None:
+        _eng._WALK_GRAPH = _saved_walk_graph
+        print("  [Mode B] Restored walk graph WITH synthetic crossings")
     _t_b = _wtime.time()
     print("\n" + "-" * 50)
     print("MODE B: Unconstrained (all safe, same walk radius)")
@@ -2094,6 +2246,27 @@ def run(input_path=None, output_path=None, iterations=None):
     if len(_syn_markers) == 0:
         print("  WARNING: zero synthetic crossings were generated with current thresholds.")
 
+    # Add crossing usage visualization for each mode (which crossings were actually used)
+    try:
+        G_walk = _eng._WALK_GRAPH or _eng._get_walk_graph(G_unc)
+        fgs_crossing_usage = _add_crossing_usage_layers(
+            m,
+            {"A": sol_a, "B": sol_b, "C": sol_c},
+            G_walk,
+            G_unc
+        )
+    except Exception as e:
+        print(f"  Warning: Could not add crossing usage visualization: {e}")
+        fgs_crossing_usage = {}
+
+    # Print crossing BFS statistics
+    crossing_stats = get_crossing_bfs_stats()
+    if crossing_stats["students_checked"] > 0:
+        print(f"  Crossing BFS stats:")
+        print(f"    Students checked: {crossing_stats['students_checked']}")
+        print(f"    Candidates enabled by crossings: {crossing_stats['candidates_via_crossing']}")
+        print(f"    Students benefiting from crossings: {crossing_stats['students_with_crossing_benefit']}")
+
     # Fill in empty FeatureGroups for any skipped modes so the layer control doesn't crash
     for _mk in ("A", "B", "C"):
         if _mk not in fgs:
@@ -2113,6 +2286,9 @@ def run(input_path=None, output_path=None, iterations=None):
         fg_cands_a=fgs_cands.get("A"),
         fg_cands_b=fgs_cands.get("B"),
         fg_cands_c=fgs_cands.get("C"),
+        fg_usage_a=fgs_crossing_usage.get("A"),
+        fg_usage_b=fgs_crossing_usage.get("B"),
+        fg_usage_c=fgs_crossing_usage.get("C"),
     )
     m.get_root().script.add_child(folium.Element(ctrl_js))
 
