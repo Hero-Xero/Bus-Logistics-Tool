@@ -14,6 +14,7 @@ import argparse
 import hashlib
 import json
 import os
+import shutil
 import sys
 
 import folium
@@ -158,6 +159,11 @@ def main():
     h = _input_hash(input_path)
     run_dir = os.path.join(_DIR, f"preview_{h}_{ts}")
     os.makedirs(run_dir, exist_ok=True)
+
+    # Save snapshot of input config for this run
+    input_snapshot = os.path.join(run_dir, "input_snapshot.json")
+    shutil.copy(input_path, input_snapshot)
+
     out_html = os.path.join(run_dir, "named_crossings_preview.html")
     out_json = os.path.join(run_dir, "named_crossings_diagnostics.json")
 

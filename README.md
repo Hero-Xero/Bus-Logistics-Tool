@@ -31,3 +31,16 @@ Done. The routing engine is now available at `http://localhost:5000`.
 check `780ff238` folder in expirement 3 for inout_caps_off_high.json
 
 check `055b75b5` folder in expirement 3 for input_caps_off.json
+
+
+#### Drive Crossings Best Result
+
+preview_bb4435e8_1773991950 in experieemnt 4
+
+even better results:
+
+preview_83d80b8f_1773993404
+
+#### want to reproduce? 
+
+`python3 experiments/experiment4_crossings/preview_named_crossings_2.py --debug`
