@@ -5,9 +5,9 @@ This script only builds drive + walk graphs, synthesizes crossings, and writes
 an HTML map. It skips ALNS and route solving for rapid iteration.
 
 Usage:
-  source .venv/bin/activate && python3 experiments/experiment4_crossings/preview_named_crossings.py
-  source .venv/bin/activate && python3 experiments/experiment4_crossings/preview_named_crossings.py --input experiments/experiment4_crossings/input.json
-  source .venv/bin/activate && python3 experiments/experiment4_crossings/preview_named_crossings.py --debug
+  source .venv/bin/activate && python3 experiments/experiment4_crossings/preview_named_crossings_2.py
+  source .venv/bin/activate && python3 experiments/experiment4_crossings/preview_named_crossings_2.py --input experiments/experiment4_crossings/input.json
+  source .venv/bin/activate && python3 experiments/experiment4_crossings/preview_named_crossings_2.py --debug
 """
 
 import argparse
@@ -174,18 +174,41 @@ def main():
     walk_radius_km = float(walk_cfg.get("radius_km", 2.0))
     G_walk = setup_walk_graph(meta, center=center, radius_m=walk_radius_km * 1000.0)
 
-    print("[3/3] Synthesizing named-opposite crossings...")
-    synth_cfg = dict(synth_cfg)
-    synth_cfg["enabled"] = True
-    synth_cfg["strategy"] = "named_opposite_secondary_tertiary"
-    synth_cfg["center_lat"] = center[0]
-    synth_cfg["center_lon"] = center[1]
-    synth_cfg.setdefault("radius_km", walk_radius_km)
-    _eng.set_walk_graph(G_walk, synthetic_cfg=synth_cfg, drive_graph=G_drive)
+    print("[3/3] Building drive node crossings...")
+    crossings, diag, debug_info = _eng.build_drive_node_crossings(
+        walk_graph=G_walk,
+        drive_graph=G_drive,
+        min_dist_m=float(synth_cfg.get("min_dist_m", 6.0)),
+        max_dist_m=float(synth_cfg.get("max_dist_m", 60.0)),
+        min_opposite_bearing_deg=float(synth_cfg.get("min_opposite_bearing_deg", 150.0)),
+        max_crossing_angle_delta_deg=float(synth_cfg.get("max_crossing_angle_delta_deg", 30.0)),
+        min_perpendicular_deg=(
+            float(synth_cfg["min_perpendicular_deg"])
+            if synth_cfg.get("min_perpendicular_deg") is not None
+            else None
+        ),
+        max_perpendicular_deg=(
+            float(synth_cfg["max_perpendicular_deg"])
+            if synth_cfg.get("max_perpendicular_deg") is not None
+            else None
+        ),
+        min_spacing_m=float(synth_cfg.get("min_spacing_m", 100.0)),
+        min_spacing_per_road_m=float(synth_cfg.get("min_spacing_per_road_m", 100.0)),
+        center_lat=center[0],
+        center_lon=center[1],
+        radius_km=walk_radius_km,
+        enable_guaranteed_connection=bool(synth_cfg.get("enable_guaranteed_connection", True)),
+        guaranteed_connection_distance_m=float(synth_cfg.get("guaranteed_connection_distance_m", 6.0)),
+        fallback_mode=str(synth_cfg.get("fallback_mode", "adaptive")),
+    )
 
-    diag = _eng.get_synthetic_diagnostics()
-    crossings = _eng.get_synthetic_crossings()
-    debug_info = _eng.get_crossing_debug_candidates()
+    # Extract drive nodes and synthetic nodes from debug info
+    drive_nodes_a = [n for n in debug_info.get("drive_nodes", []) if n["direction"] == "A"]
+    drive_nodes_b = [n for n in debug_info.get("drive_nodes", []) if n["direction"] == "B"]
+    synthetic_nodes_a = [n for n in debug_info.get("synthetic_nodes", []) if n["direction"] == "A"]
+    synthetic_nodes_b = [n for n in debug_info.get("synthetic_nodes", []) if n["direction"] == "B"]
+    real_crossings = [c for c in crossings if c.get("crossing_type") == "real_to_real"]
+    synth_crossings = [c for c in crossings if c.get("crossing_type") == "real_to_synthetic"]
 
     # Extract secondary/tertiary drive nodes for visualization (filtered by default bbox)
     drive_nodes_sec_tert = _extract_secondary_tertiary_drive_nodes_in_bbox(G_drive)
@@ -198,21 +221,53 @@ def main():
         folium.PolyLine(seg, color="#4aa3df", weight=1.5, opacity=0.5).add_to(fg_walk)
     fg_walk.add_to(m)
 
-    # Crossings with numbers
-    fg_syn = FeatureGroup(name=f"Crossings ({len(crossings)})", show=True)
-    for i, seg in enumerate(_extract_synth_segments(G_walk)):
-        folium.PolyLine(seg, color="#ff00aa", weight=4, opacity=0.95).add_to(fg_syn)
+    # Real crossings (gold)
+    fg_real = FeatureGroup(name=f"Real Crossings (gold) [{len(real_crossings)}]", show=True)
+    for i, crossing in enumerate(real_crossings):
+        lat_a, lon_a = crossing["lat_a"], crossing["lon_a"]
+        lat_b, lon_b = crossing["lat_b"], crossing["lon_b"]
+        road_name = crossing.get("road_name", "?")
+        dist = crossing.get("length_m", 0)
+        tooltip = f"Real Crossing #{i+1}<br>Road: {road_name}<br>Distance: {dist:.1f}m"
+        folium.PolyLine(
+            [(lat_a, lon_a), (lat_b, lon_b)],
+            color="gold", weight=4, opacity=0.9, tooltip=tooltip
+        ).add_to(fg_real)
         # Add numbered marker at midpoint
-        mid_lat = (seg[0][0] + seg[-1][0]) / 2
-        mid_lon = (seg[0][1] + seg[-1][1]) / 2
+        mid_lat = (lat_a + lat_b) / 2
+        mid_lon = (lon_a + lon_b) / 2
         folium.Marker(
             location=(mid_lat, mid_lon),
             icon=folium.DivIcon(
                 html=f'<div style="font-size:10px;font-weight:bold;color:#c00;background:white;padding:1px 3px;border-radius:3px;border:1px solid #c00;">{i+1}</div>',
                 icon_anchor=(8, 8),
             ),
-        ).add_to(fg_syn)
-    fg_syn.add_to(m)
+        ).add_to(fg_real)
+    fg_real.add_to(m)
+
+    # Synthetic crossings (darkorange)
+    fg_synth = FeatureGroup(name=f"Synthetic Crossings (darkorange) [{len(synth_crossings)}]", show=True)
+    for i, crossing in enumerate(synth_crossings):
+        lat_a, lon_a = crossing["lat_a"], crossing["lon_a"]
+        lat_b, lon_b = crossing["lat_b"], crossing["lon_b"]
+        road_name = crossing.get("road_name", "?")
+        dist = crossing.get("length_m", 0)
+        tooltip = f"Synthetic Crossing #{i+1}<br>Road: {road_name}<br>Distance: {dist:.1f}m"
+        folium.PolyLine(
+            [(lat_a, lon_a), (lat_b, lon_b)],
+            color="darkorange", weight=4, opacity=0.9, tooltip=tooltip
+        ).add_to(fg_synth)
+        # Add numbered marker at midpoint
+        mid_lat = (lat_a + lat_b) / 2
+        mid_lon = (lon_a + lon_b) / 2
+        folium.Marker(
+            location=(mid_lat, mid_lon),
+            icon=folium.DivIcon(
+                html=f'<div style="font-size:10px;font-weight:bold;color:#ff6600;background:white;padding:1px 3px;border-radius:3px;border:1px solid #ff6600;">{i+1+len(real_crossings)}</div>',
+                icon_anchor=(8, 8),
+            ),
+        ).add_to(fg_synth)
+    fg_synth.add_to(m)
 
     # Debug: show drive edges, walk nodes, and synthetic nodes
     if args.debug and debug_info:
@@ -247,74 +302,86 @@ def main():
         fg_edges_a.add_to(m)
         fg_edges_b.add_to(m)
 
-        # Show walk nodes used in crossings
-        fg_nodes_a = FeatureGroup(name=f"Walk Nodes A (blue) [{len([n for n in walk_nodes if n.get('direction')=='A'])}]", show=True)
-        fg_nodes_b = FeatureGroup(name=f"Walk Nodes B (orange) [{len([n for n in walk_nodes if n.get('direction')=='B'])}]", show=True)
+        # Show drive nodes used in crossings
+        fg_dnodes_a = FeatureGroup(name=f"Drive Nodes A (blue) [{len(drive_nodes_a)}]", show=True)
+        fg_dnodes_b = FeatureGroup(name=f"Drive Nodes B (orange) [{len(drive_nodes_b)}]", show=True)
 
-        for wn in walk_nodes:
-            lat, lon = wn["lat"], wn["lon"]
-            direction = wn.get("direction", "?")
-            road_name = wn.get("road_name", "?")
-            node_id = str(wn.get("node", "?"))[:10]
+        for dn in drive_nodes_a:
+            lat, lon = dn["lat"], dn["lon"]
+            road_name = dn.get("road_name", "?")
+            node_id = str(dn.get("node_id", "?"))[:10]
+            highway = dn.get("highway", "?")
 
-            tooltip = f"Node: {node_id}<br>Road: {road_name}<br>Side: {direction}"
+            tooltip = f"Drive Node A<br>ID: {node_id}<br>Road: {road_name}<br>Type: {highway}"
 
-            if direction == "A":
-                folium.CircleMarker(
-                    location=(lat, lon),
-                    radius=5,
-                    color="blue",
-                    fill=True,
-                    fillColor="blue",
-                    fillOpacity=0.7,
-                    tooltip=tooltip
-                ).add_to(fg_nodes_a)
-            else:
-                folium.CircleMarker(
-                    location=(lat, lon),
-                    radius=5,
-                    color="orange",
-                    fill=True,
-                    fillColor="orange",
-                    fillOpacity=0.7,
-                    tooltip=tooltip
-                ).add_to(fg_nodes_b)
+            folium.CircleMarker(
+                location=(lat, lon),
+                radius=5,
+                color="blue",
+                fill=True,
+                fillColor="blue",
+                fillOpacity=0.7,
+                tooltip=tooltip
+            ).add_to(fg_dnodes_a)
 
-        fg_nodes_a.add_to(m)
-        fg_nodes_b.add_to(m)
+        for dn in drive_nodes_b:
+            lat, lon = dn["lat"], dn["lon"]
+            road_name = dn.get("road_name", "?")
+            node_id = str(dn.get("node_id", "?"))[:10]
+            highway = dn.get("highway", "?")
+
+            tooltip = f"Drive Node B<br>ID: {node_id}<br>Road: {road_name}<br>Type: {highway}"
+
+            folium.CircleMarker(
+                location=(lat, lon),
+                radius=5,
+                color="orange",
+                fill=True,
+                fillColor="orange",
+                fillOpacity=0.7,
+                tooltip=tooltip
+            ).add_to(fg_dnodes_b)
+
+        fg_dnodes_a.add_to(m)
+        fg_dnodes_b.add_to(m)
 
         # Show synthetic nodes
-        fg_synth_nodes_a = FeatureGroup(name=f"Synthetic Nodes A (purple) [{len([n for n in synthetic_nodes if n.get('direction')=='A'])}]", show=True)
-        fg_synth_nodes_b = FeatureGroup(name=f"Synthetic Nodes B (green) [{len([n for n in synthetic_nodes if n.get('direction')=='B'])}]", show=True)
+        fg_synth_nodes_a = FeatureGroup(name=f"Synthetic Nodes A (purple) [{len(synthetic_nodes_a)}]", show=True)
+        fg_synth_nodes_b = FeatureGroup(name=f"Synthetic Nodes B (green) [{len(synthetic_nodes_b)}]", show=True)
 
-        for sn in synthetic_nodes:
+        for sn in synthetic_nodes_a:
             lat, lon = sn["lat"], sn["lon"]
-            direction = sn.get("direction", "?")
             road_name = sn.get("road_name", "?")
-            node_id = str(sn.get("node", "?"))[:20]
+            node_id = str(sn.get("node_id", "?"))[:20]
 
-            tooltip = f"SYNTHETIC<br>Node: {node_id}<br>Road: {road_name}<br>Side: {direction}"
+            tooltip = f"SYNTHETIC A<br>Node: {node_id}<br>Road: {road_name}"
 
-            if direction == "A":
-                folium.CircleMarker(
-                    location=(lat, lon),
-                    radius=6,
-                    color="purple",
-                    fill=True,
-                    fillColor="purple",
-                    fillOpacity=0.9,
-                    tooltip=tooltip
-                ).add_to(fg_synth_nodes_a)
-            else:
-                folium.CircleMarker(
-                    location=(lat, lon),
-                    radius=6,
-                    color="green",
-                    fill=True,
-                    fillColor="green",
-                    fillOpacity=0.9,
-                    tooltip=tooltip
-                ).add_to(fg_synth_nodes_b)
+            folium.CircleMarker(
+                location=(lat, lon),
+                radius=6,
+                color="purple",
+                fill=True,
+                fillColor="purple",
+                fillOpacity=0.9,
+                tooltip=tooltip
+            ).add_to(fg_synth_nodes_a)
+
+        for sn in synthetic_nodes_b:
+            lat, lon = sn["lat"], sn["lon"]
+            road_name = sn.get("road_name", "?")
+            node_id = str(sn.get("node_id", "?"))[:20]
+
+            tooltip = f"SYNTHETIC B<br>Node: {node_id}<br>Road: {road_name}"
+
+            folium.CircleMarker(
+                location=(lat, lon),
+                radius=6,
+                color="green",
+                fill=True,
+                fillColor="green",
+                fillOpacity=0.9,
+                tooltip=tooltip
+            ).add_to(fg_synth_nodes_b)
 
         fg_synth_nodes_a.add_to(m)
         fg_synth_nodes_b.add_to(m)
@@ -346,9 +413,10 @@ def main():
         a_count = sum(1 for e in edges if e.get("direction") == "A")
         b_count = sum(1 for e in edges if e.get("direction") == "B")
         print(f"  Debug: {a_count} in direction A, {b_count} in direction B")
-        print(f"  Debug: {len(walk_nodes)} walk nodes shown (used in crossings)")
-        print(f"  Debug: {len(synthetic_nodes)} synthetic nodes created")
-        print(f"  Debug: {len(drive_nodes_sec_tert)} secondary/tertiary drive nodes shown")
+        print(f"  Debug: {len(drive_nodes_a)} drive nodes A, {len(drive_nodes_b)} drive nodes B")
+        print(f"  Debug: {len(synthetic_nodes_a)} synthetic nodes A, {len(synthetic_nodes_b)} synthetic nodes B")
+        print(f"  Debug: {len(real_crossings)} real crossings, {len(synth_crossings)} synthetic crossings")
+        print(f"  Debug: {len(drive_nodes_sec_tert)} secondary/tertiary drive nodes shown (teal layer)")
 
     folium.LayerControl(collapsed=False).add_to(m)
     m.save(out_html)

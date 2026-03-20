@@ -46,20 +46,14 @@
   "synthetic_crossings": {
     "enabled": true,
     "strategy": "named_opposite_secondary_tertiary",
-    "min_dist_m": 1.0,
+    "min_dist_m": 6.0,
     "max_dist_m": 60.0,
-    "min_opposite_bearing_deg": 70.0,
-    "max_crossing_angle_delta_deg": 30.0,
-    "min_perpendicular_deg": 10.0,
-    "max_perpendicular_deg": 200.0,
+    "min_opposite_bearing_deg": 150.0,
     "min_spacing_m": 100.0,
-    "min_spacing_per_road_m": 500.0,
-    "max_per_road": 500,
+    "min_spacing_per_road_m": 100.0,
+    "max_per_road": 20,
     "show_only_used": true,
-    "max_total": 2000,
-    "enable_guaranteed_connection": true,
-    "guaranteed_connection_distance_m": 6.0,
-    "fallback_mode": "adaptive"
+    "max_total": 200
   },
 
   "algorithm": {

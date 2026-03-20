@@ -1258,6 +1258,795 @@ def get_crossing_debug_candidates():
     return dict(_CROSSING_DEBUG_CANDIDATES)
 
 
+# ============================================================================
+# DRIVE NODE CROSSING FUNCTIONS
+# ============================================================================
+
+def build_drive_node_crossings(
+    walk_graph,
+    drive_graph,
+    min_dist_m=6.0,
+    max_dist_m=60.0,
+    min_opposite_bearing_deg=150.0,
+    max_crossing_angle_delta_deg=30.0,
+    min_perpendicular_deg=None,
+    max_perpendicular_deg=None,
+    min_spacing_m=100.0,
+    min_spacing_per_road_m=100.0,
+    center_lat=None,
+    center_lon=None,
+    radius_km=None,
+    enable_guaranteed_connection=True,
+    guaranteed_connection_distance_m=6.0,
+    fallback_mode="adaptive",
+):
+    """Build crossings between drive nodes on opposite sides of secondary/tertiary roads.
+
+    Algorithm:
+    1. Extract drive nodes from oneway secondary/tertiary edges
+    2. Group by road name, split into opposite directions A/B
+    3. Sort both sides by position along road axis
+    4. For each B node: find closest unpaired A, validate, pair or skip
+    5. Create synthetic nodes for unpaired drive nodes
+
+    NOTE: Connects ALL possible drive nodes - no max_per_road or max_total limits.
+
+    Returns:
+        (crossings, diagnostics, debug_info)
+    """
+    crossings = []
+    diag = {
+        "strategy": "drive_node_crossings",
+        "drive_edges_found": 0,
+        "drive_nodes_extracted": 0,
+        "roads_found": 0,
+        "roads_with_both_directions": 0,
+        "real_to_real_crossings": 0,
+        "real_to_synthetic_crossings": 0,
+        "synthetic_nodes_created": 0,
+        "rejected_no_opposite": 0,
+
+        # NEW: Granular pairing rejection tracking
+        "pairing_attempts": 0,
+        "pairing_rejected_distance_too_short": 0,
+        "pairing_rejected_distance_too_long": 0,
+        "pairing_rejected_angle": 0,
+        "pairing_rejected_bearing_calc_failed": 0,
+
+        # Existing counters
+        "rejected_distance": 0,  # Legacy counter, will be replaced by granular ones
+        "rejected_angle": 0,     # Legacy counter, will be replaced by granular ones
+        "rejected_spacing": 0,
+        "skipped_global_connection_lock": 0,
+        "rejected_fallback_geometry": 0,
+        "fallback_reused_existing_nodes": 0,
+
+        # NEW: Enhanced 3-stage fallback tracking
+        "fallback_projected_with_spacing": 0,
+        "fallback_projected_no_spacing": 0,
+        "fallback_guaranteed": 0,
+        "fallback_failed_completely": 0,
+    }
+
+    debug_info = {
+        "edges": [],
+        "drive_nodes": [],
+        "synthetic_nodes": [],
+        "crossings": [],
+    }
+
+    if walk_graph is None or drive_graph is None:
+        global _SYNTHETIC_DIAGNOSTICS
+        _SYNTHETIC_DIAGNOSTICS = diag
+        _store_debug_edges([], [], [])
+        return crossings, diag, debug_info
+
+    cos_lat_ref = math.cos(math.radians(center_lat)) if center_lat is not None else 1.0
+    allowed_hw = {"secondary", "tertiary"}
+
+    # Helper closures for coordinate conversion
+    def _to_meters(lat, lon):
+        return lon * 111000.0 * cos_lat_ref, lat * 111000.0
+
+    def _from_meters(x_m, y_m):
+        return y_m / 111000.0, x_m / (111000.0 * cos_lat_ref)
+
+    def _bearing_from_xy(x1, y1, x2, y2):
+        dx = x2 - x1
+        dy = y2 - y1
+        if abs(dx) < 1e-9 and abs(dy) < 1e-9:
+            return None
+        return math.degrees(math.atan2(dx, dy)) % 360.0
+
+    def _perp_delta_deg(crossing_bearing, road_axis_bearing):
+        p1 = (road_axis_bearing + 90.0) % 360.0
+        p2 = (road_axis_bearing + 270.0) % 360.0
+        return min(_angle_diff_deg(crossing_bearing, p1), _angle_diff_deg(crossing_bearing, p2))
+
+    def _is_crossing_angle_valid(crossing_bearing, road_axis_bearing):
+        """Validate crossing angle against configured perpendicular constraints.
+
+        Returns tuple: (is_valid, debug_delta_to_perpendicular).
+        """
+        cross_axis = _angle_diff_deg(crossing_bearing, road_axis_bearing)
+        delta_to_perp = abs(cross_axis - 90.0)
+
+        if min_perpendicular_deg is not None or max_perpendicular_deg is not None:
+            min_deg = float(min_perpendicular_deg) if min_perpendicular_deg is not None else (90.0 - float(max_crossing_angle_delta_deg))
+            max_deg = float(max_perpendicular_deg) if max_perpendicular_deg is not None else (90.0 + float(max_crossing_angle_delta_deg))
+            return min_deg <= cross_axis <= max_deg, delta_to_perp
+
+        return delta_to_perp <= float(max_crossing_angle_delta_deg), delta_to_perp
+
+    def _in_radius(lat, lon):
+        if center_lat is None or center_lon is None or radius_km is None:
+            return True
+        dlat = abs(lat - center_lat) * 111.0
+        dlon = abs(lon - center_lon) * 111.0 * cos_lat_ref
+        return math.sqrt(dlat * dlat + dlon * dlon) <= radius_km
+
+    # Step 1: Extract drive nodes from oneway secondary/tertiary edges
+    drive_edges_by_name = {}  # (road_name, highway) -> list of edge dicts
+
+    for u, v, key, data in drive_graph.edges(keys=True, data=True):
+        hw = data.get("highway", "")
+        if isinstance(hw, list):
+            hw = hw[0] if hw else ""
+        hw = str(hw).lower().strip()
+
+        if hw not in allowed_hw:
+            continue
+
+        oneway = data.get("oneway", False)
+        if isinstance(oneway, str):
+            oneway = oneway.lower() in ("yes", "true", "1")
+        if not oneway:
+            continue
+
+        name = data.get("name", "")
+        if isinstance(name, list):
+            name = name[0] if name else ""
+        name = str(name).strip()
+        if not name:
+            continue
+
+        u_data = drive_graph.nodes[u]
+        v_data = drive_graph.nodes[v]
+        u_lat, u_lon = u_data.get("y"), u_data.get("x")
+        v_lat, v_lon = v_data.get("y"), v_data.get("x")
+
+        if None in (u_lat, u_lon, v_lat, v_lon):
+            continue
+
+        mid_lat = (u_lat + v_lat) / 2.0
+        mid_lon = (u_lon + v_lon) / 2.0
+        if not _in_radius(mid_lat, mid_lon):
+            continue
+
+        bearing = data.get("bearing")
+        if bearing is None:
+            dlat = (v_lat - u_lat) * 111000.0
+            dlon = (v_lon - u_lon) * 111000.0 * cos_lat_ref
+            bearing = math.degrees(math.atan2(dlon, dlat)) % 360.0
+
+        road_key = (name, hw)
+        if road_key not in drive_edges_by_name:
+            drive_edges_by_name[road_key] = []
+
+        u_x, u_y = _to_meters(u_lat, u_lon)
+        v_x, v_y = _to_meters(v_lat, v_lon)
+
+        drive_edges_by_name[road_key].append({
+            "u": u, "v": v, "key": key,
+            "u_lat": u_lat, "u_lon": u_lon,
+            "v_lat": v_lat, "v_lon": v_lon,
+            "u_x": u_x, "u_y": u_y,
+            "v_x": v_x, "v_y": v_y,
+            "name": name, "highway": hw,
+            "bearing": float(bearing),
+        })
+
+    diag["drive_edges_found"] = sum(len(edges) for edges in drive_edges_by_name.values())
+    diag["roads_found"] = len(drive_edges_by_name)
+
+    if not drive_edges_by_name:
+        _SYNTHETIC_DIAGNOSTICS = diag
+        _store_debug_edges([], [], [])
+        return crossings, diag, debug_info
+
+    # Extract unique drive nodes from edges
+    drive_nodes_by_road = {}  # road_key -> {node_id -> node_record}
+
+    for road_key, edges in drive_edges_by_name.items():
+        nodes = {}
+        for edge in edges:
+            # Add both endpoints
+            for endpoint in ['u', 'v']:
+                node_id = edge[endpoint]
+                if node_id not in nodes:
+                    lat = edge[f"{endpoint}_lat"]
+                    lon = edge[f"{endpoint}_lon"]
+                    x = edge[f"{endpoint}_x"]
+                    y = edge[f"{endpoint}_y"]
+                    nodes[node_id] = {
+                        "node_id": node_id,
+                        "lat": lat,
+                        "lon": lon,
+                        "x": x,
+                        "y": y,
+                        "edge_bearing": edge["bearing"],
+                        "road_name": edge["name"],
+                        "highway": edge["highway"],
+                    }
+        drive_nodes_by_road[road_key] = nodes
+
+    diag["drive_nodes_extracted"] = sum(len(nodes) for nodes in drive_nodes_by_road.values())
+
+    # Synthetic node counter
+    synthetic_counter = [0]
+
+    def _create_synthetic_node(lat, lon, direction):
+        """Create a new synthetic walk node."""
+        node_id = f"synth_drive_crossing_{synthetic_counter[0]}"
+        synthetic_counter[0] += 1
+        walk_graph.add_node(node_id, y=lat, x=lon, synthetic=True)
+        x_m, y_m = _to_meters(lat, lon)
+        return {
+            "node_id": node_id,
+            "lat": lat,
+            "lon": lon,
+            "x": x_m,
+            "y": y_m,
+            "direction": direction,
+        }
+
+    def _create_fallback_crossing(
+        source_node,
+        target_x,
+        target_y,
+        crossing_type,
+        globally_connected_nodes,
+        existing_crossings,
+        all_crossing_midpoints,
+        walk_graph,
+        diag,
+        debug_info,
+        road_key,
+        synthetic_counter,
+        _from_meters,
+        _create_synthetic_node,
+        _find_existing_node_near_xy,
+    ):
+        """Helper to create fallback crossing and update all tracking.
+
+        Returns True if crossing was created successfully, False otherwise.
+        """
+        dist = math.hypot(source_node["x"] - target_x, source_node["y"] - target_y)
+        mid_x, mid_y = (source_node["x"] + target_x) / 2, (source_node["y"] + target_y) / 2
+
+        # Find or create target node
+        target_node = _find_existing_node_near_xy(target_x, target_y, tolerance_m=1.5)
+        created_synthetic = False
+
+        if target_node is None:
+            target_lat, target_lon = _from_meters(target_x, target_y)
+            # Synthetic node is on opposite side from source
+            source_dir = source_node.get("direction", "A")
+            target_dir = "B" if source_dir == "A" else "A"
+            target_node = _create_synthetic_node(target_lat, target_lon, target_dir)
+            created_synthetic = True
+            diag["synthetic_nodes_created"] += 1
+
+            # Add to debug_info for visualization
+            debug_info["synthetic_nodes"].append({
+                "node_id": target_node["node_id"],
+                "lat": target_lat,
+                "lon": target_lon,
+                "direction": target_dir,
+                "road_name": road_key[0],
+            })
+        else:
+            diag["fallback_reused_existing_nodes"] += 1
+
+        # Check if target already connected
+        if target_node["node_id"] in globally_connected_nodes:
+            diag["skipped_global_connection_lock"] += 1
+            return False
+
+        # Create edge
+        n1, n2 = source_node["node_id"], target_node["node_id"]
+        edge_key = tuple(sorted([n1, n2], key=str))
+
+        if walk_graph.has_edge(n1, n2) or edge_key in existing_crossings:
+            return False
+
+        walk_graph.add_edge(
+            n1, n2,
+            length=dist,
+            travel_time=dist / 80.0,
+            synthetic_crossing=True,
+            is_safe_to_cross=True,
+            crossing_rule="drive_node_crossings",
+            crossing_subtype=crossing_type,
+            road_name=road_key[0],
+            road_class=road_key[1],
+        )
+
+        existing_crossings.add(edge_key)
+        all_crossing_midpoints.append((mid_x, mid_y))
+        globally_connected_nodes.add(n1)
+        globally_connected_nodes.add(n2)
+
+        # Add to crossings list
+        final_crossing_type = "real_to_synthetic" if created_synthetic else "real_to_real"
+        crossings.append({
+            "node_a": n1,
+            "node_b": n2,
+            "lat_a": source_node["lat"],
+            "lon_a": source_node["lon"],
+            "lat_b": target_node["lat"],
+            "lon_b": target_node["lon"],
+            "length_m": dist,
+            "crossing_type": final_crossing_type,
+            "road_name": road_key[0],
+        })
+
+        # Add to debug_info
+        debug_info["crossings"].append({
+            "node_a": n1,
+            "node_b": n2,
+            "crossing_type": crossing_type,
+            "road_name": road_key[0],
+            "distance_m": round(dist, 2),
+        })
+
+        # Increment correct diagnostic counter
+        if created_synthetic:
+            diag["real_to_synthetic_crossings"] += 1
+        else:
+            diag["real_to_real_crossings"] += 1
+
+        return True
+
+    def _nearest_point_on_segment(px, py, ax, ay, bx, by):
+        """Return nearest point on segment AB to point P."""
+        abx, aby = bx - ax, by - ay
+        apx, apy = px - ax, py - ay
+        ab_len_sq = abx * abx + aby * aby
+        if ab_len_sq < 1e-9:
+            return ax, ay
+        t = max(0, min(1, (apx * abx + apy * aby) / ab_len_sq))
+        return ax + t * abx, ay + t * aby
+
+    def _nearest_projection_to_side(source_x, source_y, segments):
+        best_proj = None
+        best_proj_dist = float("inf")
+        for ax, ay, bx, by in segments:
+            px, py = _nearest_point_on_segment(source_x, source_y, ax, ay, bx, by)
+            dist = math.hypot(source_x - px, source_y - py)
+            if dist < best_proj_dist:
+                best_proj_dist = dist
+                best_proj = (px, py)
+        return best_proj
+
+    def _fallback_target_on_opposite_side(source_node, target_segments):
+        """Project fallback synthetic node directly onto opposite-side geometry."""
+        if not target_segments:
+            return None
+
+        sx, sy = source_node["x"], source_node["y"]
+        proj = _nearest_projection_to_side(sx, sy, target_segments)
+        if proj is None:
+            return None
+        return proj
+
+    def _find_existing_node_near_xy(x_m, y_m, tolerance_m=1.5):
+        """Return an existing walk node near a projected fallback target.
+
+        This prevents creating synthetic nodes exactly over existing real/synthetic nodes.
+        """
+        tol = float(tolerance_m)
+        best = None
+        best_d = float("inf")
+        for node_id, ndata in walk_graph.nodes(data=True):
+            lat = ndata.get("y")
+            lon = ndata.get("x")
+            if lat is None or lon is None:
+                continue
+            nx_m, ny_m = _to_meters(lat, lon)
+            d = math.hypot(nx_m - x_m, ny_m - y_m)
+            if d <= tol and d < best_d:
+                best = {
+                    "node_id": node_id,
+                    "lat": lat,
+                    "lon": lon,
+                    "x": nx_m,
+                    "y": ny_m,
+                    "synthetic": bool(ndata.get("synthetic", False)),
+                }
+                best_d = d
+        return best
+
+    # Track all crossings for spacing and global node usage.
+    all_crossing_midpoints = []
+    existing_crossings = set()
+    globally_connected_nodes = set()
+
+    for u, v, k, data in walk_graph.edges(keys=True, data=True):
+        if data.get("synthetic_crossing"):
+            existing_crossings.add(tuple(sorted([u, v], key=str)))
+
+    # Step 2: Process each road
+    for road_key, node_dict in drive_nodes_by_road.items():
+        nodes = list(node_dict.values())
+
+        if len(nodes) < 2:
+            continue
+
+        # Split into opposite directions A/B based on bearing
+        ref_bearing = nodes[0]["edge_bearing"]
+        nodes_a, nodes_b = [], []
+
+        for node in nodes:
+            angle_diff = _angle_diff_deg(node["edge_bearing"], ref_bearing)
+            if angle_diff < 90.0:
+                node["direction"] = "A"
+                nodes_a.append(node)
+            else:
+                node["direction"] = "B"
+                nodes_b.append(node)
+
+        if not nodes_a or not nodes_b:
+            diag["rejected_no_opposite"] += 1
+            continue
+
+        # Check if opposite bearings differ enough
+        avg_bearing_a = sum(n["edge_bearing"] for n in nodes_a) / len(nodes_a)
+        avg_bearing_b = sum(n["edge_bearing"] for n in nodes_b) / len(nodes_b)
+        if _angle_diff_deg(avg_bearing_a, avg_bearing_b) < min_opposite_bearing_deg:
+            diag["rejected_no_opposite"] += 1
+            continue
+
+        diag["roads_with_both_directions"] += 1
+        axis_bearing = avg_bearing_a
+
+        # Store edges for debug visualization
+        for edge in drive_edges_by_name[road_key]:
+            # Determine direction based on bearing
+            angle_diff = _angle_diff_deg(edge["bearing"], ref_bearing)
+            direction = "A" if angle_diff < 90.0 else "B"
+            debug_info["edges"].append({
+                "u_lat": edge["u_lat"], "u_lon": edge["u_lon"],
+                "v_lat": edge["v_lat"], "v_lon": edge["v_lon"],
+                "name": edge["name"], "highway": edge["highway"],
+                "bearing": edge["bearing"], "direction": direction,
+            })
+
+        # Sort nodes by position along road axis
+        # Calculate reference point (centroid)
+        ref_x = sum(n["x"] for n in nodes_a + nodes_b) / len(nodes_a + nodes_b)
+        ref_y = sum(n["y"] for n in nodes_a + nodes_b) / len(nodes_a + nodes_b)
+
+        # Create axis unit vector
+        axis_rad = math.radians(axis_bearing)
+        axis_dx = math.sin(axis_rad)
+        axis_dy = math.cos(axis_rad)
+
+        # Project nodes onto axis
+        for node in nodes_a + nodes_b:
+            dx = node["x"] - ref_x
+            dy = node["y"] - ref_y
+            node["axis_position"] = dx * axis_dx + dy * axis_dy
+
+        nodes_a.sort(key=lambda n: n["axis_position"])
+        nodes_b.sort(key=lambda n: n["axis_position"])
+
+        # Store drive nodes for debug
+        for node in nodes_a:
+            debug_info["drive_nodes"].append({
+                "node_id": node["node_id"],
+                "lat": node["lat"],
+                "lon": node["lon"],
+                "road_name": node["road_name"],
+                "highway": node["highway"],
+                "direction": "A",
+            })
+        for node in nodes_b:
+            debug_info["drive_nodes"].append({
+                "node_id": node["node_id"],
+                "lat": node["lat"],
+                "lon": node["lon"],
+                "road_name": node["road_name"],
+                "highway": node["highway"],
+                "direction": "B",
+            })
+
+        # Collect edge segments for each side (for synthetic projection)
+        segs_a = []
+        for edge in drive_edges_by_name[road_key]:
+            angle_diff = _angle_diff_deg(edge["bearing"], ref_bearing)
+            if angle_diff < 90.0:
+                segs_a.append((edge["u_x"], edge["u_y"], edge["v_x"], edge["v_y"]))
+
+        segs_b = []
+        for edge in drive_edges_by_name[road_key]:
+            angle_diff = _angle_diff_deg(edge["bearing"], ref_bearing)
+            if angle_diff >= 90.0:
+                segs_b.append((edge["u_x"], edge["u_y"], edge["v_x"], edge["v_y"]))
+
+        # Step 3: Pair B -> A (greedy sorted matching)
+        paired_a = set()
+        paired_b = set()
+        road_midpoints = []
+
+        for node_b in nodes_b:
+            if node_b["node_id"] in globally_connected_nodes:
+                diag["skipped_global_connection_lock"] += 1
+                continue
+
+            # Find closest unpaired A node
+            best_a = None
+            best_dist = float("inf")
+
+            for node_a in nodes_a:
+                if node_a["node_id"] in paired_a:
+                    continue
+                if node_a["node_id"] in globally_connected_nodes:
+                    continue
+
+                diag["pairing_attempts"] += 1
+                dist = math.hypot(node_a["x"] - node_b["x"], node_a["y"] - node_b["y"])
+
+                # Check distance constraints WITH COUNTERS
+                if dist < min_dist_m:
+                    diag["pairing_rejected_distance_too_short"] += 1
+                    continue
+                if dist > max_dist_m:
+                    diag["pairing_rejected_distance_too_long"] += 1
+                    continue
+
+                # Check perpendicularity WITH COUNTERS
+                cross_bearing = _bearing_from_xy(node_a["x"], node_a["y"], node_b["x"], node_b["y"])
+                if cross_bearing is None:
+                    diag["pairing_rejected_bearing_calc_failed"] += 1
+                    continue
+
+                angle_ok, _angle_delta = _is_crossing_angle_valid(cross_bearing, axis_bearing)
+                if not angle_ok:
+                    diag["pairing_rejected_angle"] += 1
+                    continue
+
+                if dist < best_dist:
+                    best_dist = dist
+                    best_a = node_a
+
+            if best_a:
+                # Valid real-to-real crossing
+                node_a = best_a
+                paired_a.add(node_a["node_id"])
+                paired_b.add(node_b["node_id"])
+
+                # Check spacing
+                mid_x = (node_a["x"] + node_b["x"]) / 2
+                mid_y = (node_a["y"] + node_b["y"]) / 2
+
+                too_close_global = any(
+                    math.hypot(mid_x - ox, mid_y - oy) < min_spacing_m
+                    for ox, oy in all_crossing_midpoints
+                )
+
+                if too_close_global:
+                    diag["rejected_spacing"] += 1
+                    paired_a.discard(node_a["node_id"])
+                    paired_b.discard(node_b["node_id"])
+                    continue
+
+                # Create crossing edge
+                n1, n2 = node_a["node_id"], node_b["node_id"]
+                edge_key = tuple(sorted([n1, n2], key=str))
+
+                if walk_graph.has_edge(n1, n2) or edge_key in existing_crossings:
+                    continue
+
+                walk_graph.add_edge(
+                    n1, n2,
+                    length=best_dist,
+                    travel_time=best_dist / 80.0,
+                    synthetic_crossing=True,
+                    is_safe_to_cross=True,
+                    crossing_rule="drive_node_crossings",
+                    road_name=road_key[0],
+                    road_class=road_key[1],
+                )
+                existing_crossings.add(edge_key)
+                all_crossing_midpoints.append((mid_x, mid_y))
+                road_midpoints.append((mid_x, mid_y))
+                globally_connected_nodes.add(node_a["node_id"])
+                globally_connected_nodes.add(node_b["node_id"])
+
+                mid_lat, mid_lon = _from_meters(mid_x, mid_y)
+                crossings.append({
+                    "lat": mid_lat,
+                    "lon": mid_lon,
+                    "lat_a": node_a["lat"],
+                    "lon_a": node_a["lon"],
+                    "lat_b": node_b["lat"],
+                    "lon_b": node_b["lon"],
+                    "length_m": round(best_dist, 1),
+                    "road_name": road_key[0],
+                    "road_class": road_key[1],
+                    "crossing_type": "real_to_real",
+                })
+
+                debug_info["crossings"].append({
+                    "lat_a": node_a["lat"],
+                    "lon_a": node_a["lon"],
+                    "lat_b": node_b["lat"],
+                    "lon_b": node_b["lon"],
+                    "type": "real_to_real",
+                    "road_name": road_key[0],
+                })
+
+                diag["real_to_real_crossings"] += 1
+
+        # Step 4: Create synthetic nodes for unpaired A nodes (ENHANCED with 3-stage fallback).
+        for node_a in nodes_a:
+            if node_a["node_id"] in paired_a:
+                continue
+            if node_a["node_id"] in globally_connected_nodes:
+                diag["skipped_global_connection_lock"] += 1
+                continue
+
+            # Stage 1: Try projection with normal spacing
+            target_xy = _fallback_target_on_opposite_side(node_a, segs_b)
+            if target_xy is not None:
+                synth_x, synth_y = target_xy
+                dist = math.hypot(node_a["x"] - synth_x, node_a["y"] - synth_y)
+                mid_x, mid_y = (node_a["x"] + synth_x) / 2, (node_a["y"] + synth_y) / 2
+
+                too_close = any(
+                    math.hypot(mid_x - ox, mid_y - oy) < min_spacing_m
+                    for ox, oy in all_crossing_midpoints
+                )
+
+                if not too_close:
+                    # SUCCESS: Create crossing with projection
+                    success = _create_fallback_crossing(
+                        node_a, synth_x, synth_y, "real_to_synthetic_projected",
+                        globally_connected_nodes, existing_crossings,
+                        all_crossing_midpoints, walk_graph, diag, debug_info,
+                        road_key, synthetic_counter, _from_meters, _create_synthetic_node,
+                        _find_existing_node_near_xy
+                    )
+                    if success:
+                        diag["fallback_projected_with_spacing"] += 1
+                        road_midpoints.append((mid_x, mid_y))
+                        continue
+
+            # Stage 2: If enabled, retry projection WITHOUT spacing constraint
+            if enable_guaranteed_connection and target_xy is not None:
+                synth_x, synth_y = target_xy
+                mid_x, mid_y = (node_a["x"] + synth_x) / 2, (node_a["y"] + synth_y) / 2
+                success = _create_fallback_crossing(
+                    node_a, synth_x, synth_y, "real_to_synthetic_projected_no_spacing",
+                    globally_connected_nodes, existing_crossings,
+                    all_crossing_midpoints, walk_graph, diag, debug_info,
+                    road_key, synthetic_counter, _from_meters, _create_synthetic_node,
+                    _find_existing_node_near_xy
+                )
+                if success:
+                    diag["fallback_projected_no_spacing"] += 1
+                    road_midpoints.append((mid_x, mid_y))
+                    continue
+
+            # Stage 3: GUARANTEED fallback - place at exactly 6m perpendicular
+            if enable_guaranteed_connection:
+                # Calculate perpendicular direction (90° from road axis)
+                perp_angle = (axis_bearing + 90.0) % 360.0
+                perp_rad = math.radians(perp_angle)
+                guaranteed_dist = float(guaranteed_connection_distance_m)  # 6.0m
+
+                synth_x = node_a["x"] + guaranteed_dist * math.sin(perp_rad)
+                synth_y = node_a["y"] + guaranteed_dist * math.cos(perp_rad)
+                mid_x, mid_y = (node_a["x"] + synth_x) / 2, (node_a["y"] + synth_y) / 2
+
+                success = _create_fallback_crossing(
+                    node_a, synth_x, synth_y, "real_to_synthetic_guaranteed",
+                    globally_connected_nodes, existing_crossings,
+                    all_crossing_midpoints, walk_graph, diag, debug_info,
+                    road_key, synthetic_counter, _from_meters, _create_synthetic_node,
+                    _find_existing_node_near_xy
+                )
+                if success:
+                    diag["fallback_guaranteed"] += 1
+                    road_midpoints.append((mid_x, mid_y))
+                    continue
+
+            # No connection created (only if guaranteed connection disabled)
+            diag["fallback_failed_completely"] += 1
+
+        # Step 5: Create synthetic nodes for unpaired B nodes (ENHANCED with 3-stage fallback).
+        for node_b in nodes_b:
+            if node_b["node_id"] in paired_b:
+                continue
+            if node_b["node_id"] in globally_connected_nodes:
+                diag["skipped_global_connection_lock"] += 1
+                continue
+
+            # Stage 1: Try projection with normal spacing
+            target_xy = _fallback_target_on_opposite_side(node_b, segs_a)
+            if target_xy is not None:
+                synth_x, synth_y = target_xy
+                dist = math.hypot(node_b["x"] - synth_x, node_b["y"] - synth_y)
+                mid_x, mid_y = (synth_x + node_b["x"]) / 2, (synth_y + node_b["y"]) / 2
+
+                too_close = any(
+                    math.hypot(mid_x - ox, mid_y - oy) < min_spacing_m
+                    for ox, oy in all_crossing_midpoints
+                )
+
+                if not too_close:
+                    # SUCCESS: Create crossing with projection
+                    success = _create_fallback_crossing(
+                        node_b, synth_x, synth_y, "real_to_synthetic_projected",
+                        globally_connected_nodes, existing_crossings,
+                        all_crossing_midpoints, walk_graph, diag, debug_info,
+                        road_key, synthetic_counter, _from_meters, _create_synthetic_node,
+                        _find_existing_node_near_xy
+                    )
+                    if success:
+                        diag["fallback_projected_with_spacing"] += 1
+                        road_midpoints.append((mid_x, mid_y))
+                        continue
+
+            # Stage 2: If enabled, retry projection WITHOUT spacing constraint
+            if enable_guaranteed_connection and target_xy is not None:
+                synth_x, synth_y = target_xy
+                mid_x, mid_y = (synth_x + node_b["x"]) / 2, (synth_y + node_b["y"]) / 2
+                success = _create_fallback_crossing(
+                    node_b, synth_x, synth_y, "real_to_synthetic_projected_no_spacing",
+                    globally_connected_nodes, existing_crossings,
+                    all_crossing_midpoints, walk_graph, diag, debug_info,
+                    road_key, synthetic_counter, _from_meters, _create_synthetic_node,
+                    _find_existing_node_near_xy
+                )
+                if success:
+                    diag["fallback_projected_no_spacing"] += 1
+                    road_midpoints.append((mid_x, mid_y))
+                    continue
+
+            # Stage 3: GUARANTEED fallback - place at exactly 6m perpendicular (opposite direction)
+            if enable_guaranteed_connection:
+                # Calculate perpendicular direction (270° from road axis for B nodes)
+                perp_angle = (axis_bearing - 90.0) % 360.0
+                perp_rad = math.radians(perp_angle)
+                guaranteed_dist = float(guaranteed_connection_distance_m)  # 6.0m
+
+                synth_x = node_b["x"] + guaranteed_dist * math.sin(perp_rad)
+                synth_y = node_b["y"] + guaranteed_dist * math.cos(perp_rad)
+                mid_x, mid_y = (synth_x + node_b["x"]) / 2, (synth_y + node_b["y"]) / 2
+
+                success = _create_fallback_crossing(
+                    node_b, synth_x, synth_y, "real_to_synthetic_guaranteed",
+                    globally_connected_nodes, existing_crossings,
+                    all_crossing_midpoints, walk_graph, diag, debug_info,
+                    road_key, synthetic_counter, _from_meters, _create_synthetic_node,
+                    _find_existing_node_near_xy
+                )
+                if success:
+                    diag["fallback_guaranteed"] += 1
+                    road_midpoints.append((mid_x, mid_y))
+                    continue
+
+            # No connection created (only if guaranteed connection disabled)
+            diag["fallback_failed_completely"] += 1
+
+    _SYNTHETIC_DIAGNOSTICS = diag
+    _store_debug_edges(debug_info["edges"], debug_info["drive_nodes"], debug_info["synthetic_nodes"])
+
+    return crossings, diag, debug_info
+
+
 def set_walk_graph(walk_graph, synthetic_cfg=None, drive_graph=None):
     """Set a dedicated walk graph and optionally add synthetic crossings."""
     global _WALK_GRAPH, _SYNTHETIC_CROSSINGS
